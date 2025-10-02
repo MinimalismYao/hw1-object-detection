@@ -22,6 +22,7 @@ data/*.zip
 experiments/logs/
 runs/
 checkpoints/
+vis_gt/
 
 # ---- 系統相關檔案 (避免 Mac / Windows 雜檔被推上去) ----
 .DS_Store
