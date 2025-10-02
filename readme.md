@@ -1,8 +1,6 @@
 <!-- cSpell:disable -->
 # README.md (初稿)
 
-測試從1650推送
-
 # HW1 - Object Detection  
 TAICA 課程作業專案  
 
