@@ -1,3 +1,4 @@
+<!-- cSpell:disable -->
 # README.md (初稿)
 
 # HW1 - Object Detection  
