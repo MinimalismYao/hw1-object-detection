@@ -1,7 +1,7 @@
-# ==== Core PyTorch (3080 用 CUDA 12.1/12.2) ====
-torch==2.5.1+cu121
-torchvision==0.20.1+cu121
-torchaudio==2.5.1+cu121
+# ==== Core PyTorch (CPU 版，方便 Debug) ====
+torch==2.5.1
+torchvision==0.20.1
+torchaudio==2.5.1
 
 # ==== Computer Vision / Data ====
 opencv-python==4.12.0.88
