@@ -1,59 +1,46 @@
 # src/train.py
-import torch
+import os, torch
 from torch.utils.data import DataLoader
-from torchvision.models.detection import FasterRCNN
-from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
-
-from dataset import PigsDataset   # 你要自己寫的 Dataset
+from dataset import PigsDataset, collate_fn
 from transforms import get_transforms
+from model import get_fasterrcnn_r50_fpn
 
-def get_model(num_classes=2):
-    # 建立 ResNet50 + FPN backbone，不載入任何 ImageNet 權重
-    backbone = resnet_fpn_backbone('resnet50', weights=None, trainable_layers=0)
-    model = FasterRCNN(backbone, num_classes=num_classes)
-    return model
-
-def train_one_epoch(model, dataloader, optimizer, device):
+def train_one_epoch(model, loader, optimizer, device):
     model.train()
-    total_loss = 0
-    for images, targets in dataloader:
+    avg_loss = 0.0
+    for images, targets in loader:
         images = [img.to(device) for img in images]
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-
         loss_dict = model(images, targets)
-        losses = sum(loss for loss in loss_dict.values())
-
+        loss = sum(loss_dict.values())
         optimizer.zero_grad()
-        losses.backward()
+        loss.backward()
         optimizer.step()
-
-        total_loss += losses.item()
-    return total_loss / len(dataloader)
+        avg_loss += loss.item()
+    return avg_loss / max(1, len(loader))
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Dataset & DataLoader
-    train_dataset = PigsDataset("data/train/img", "data/train/gt.txt", transforms=get_transforms(train=True))
-    train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True, collate_fn=lambda x: tuple(zip(*x)))
+    train_ds = PigsDataset(img_dir="data/train/img",
+                           gt_txt="data/train/gt.txt",
+                           transforms=get_transforms(train=True))
+    train_loader = DataLoader(train_ds, batch_size=1, shuffle=True,
+                              num_workers=2, collate_fn=collate_fn)
 
-    # Model
-    model = get_model(num_classes=2)
-    model.to(device)
+    model = get_fasterrcnn_r50_fpn(num_classes=2, freeze_backbone=True).to(device)
 
-    # Optimizer
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.SGD(params, lr=0.005, momentum=0.9, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
 
-    # Training Loop
-    for epoch in range(10):
-        loss = train_one_epoch(model, train_loader, optimizer, device)
-        print(f"[Epoch {epoch}] Loss: {loss:.4f}")
-        scheduler.step()
+    os.makedirs("experiments/logs", exist_ok=True)
 
-        # 儲存 checkpoint
-        torch.save(model.state_dict(), f"experiments/logs/model_epoch{epoch}.pth")
+    for epoch in range(2):  # 先跑短一點驗證流程
+        loss = train_one_epoch(model, train_loader, optimizer, device)
+        print(f"[Epoch {epoch}] loss={loss:.4f}")
+        scheduler.step()
+        torch.save(model.state_dict(), f"experiments/logs/fasterrcnn_r50fpn_e{epoch}.pth")
 
 if __name__ == "__main__":
     main()
