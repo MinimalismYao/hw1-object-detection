@@ -74,10 +74,17 @@ def draw_boxes_on_image(img_bgr, bboxes: List[BBox], thickness=2, alpha=0.25):
     h_img, w_img = img_bgr.shape[:2]
 
     # 三種固定的淺色 (BGR)
+    '''
     pastel_colors = [
         (255, 200, 200),  # 淺粉紅
         (200, 255, 255),  # 淺青藍
         (200, 220, 255),  # 淺藍紫
+    ]
+    '''
+    pastel_colors = [
+        (255, 228, 196),  # 淺米色 (Bisque)
+        (176, 224, 230),  # 淺藍綠 (PowderBlue)
+        (221, 160, 221),  # 淺紫色 (Plum)
     ]
 
     for (l, t, w, h) in bboxes:
