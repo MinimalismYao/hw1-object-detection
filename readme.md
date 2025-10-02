@@ -1,4 +1,4 @@
-# 📄 README.md (初稿)
+# README.md (初稿)
 
 # HW1 - Object Detection  
 TAICA 課程作業專案  
@@ -96,7 +96,7 @@ python src/infer_to_csv.py --checkpoint experiments/logs/best_model.pth --out su
 
 ---
 
-## 📊 報告內容 (簡要)
+## 報告內容 (簡要)
 
 * **Model Description**：Faster R-CNN + ResNet-50 (backbone frozen)
 * **Implementation Details**：前處理、augmentation、訓練策略
@@ -105,7 +105,7 @@ python src/infer_to_csv.py --checkpoint experiments/logs/best_model.pth --out su
 
 ---
 
-## 👤 作者
+## 作者
 
 * 學校：`NTUT`
 * 學號：`114408051`
