@@ -1,6 +1,8 @@
 <!-- cSpell:disable -->
 # README.md (初稿)
-13213213
+
+> 所有 git 操作皆可在 vscode 原始檔控制功能完成。
+
 # HW1 - Object Detection  
 TAICA 課程作業專案  
 
