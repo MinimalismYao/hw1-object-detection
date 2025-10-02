@@ -14,6 +14,7 @@ from typing import Dict, List, Tuple, Optional
 import cv2
 import matplotlib.pyplot as plt
 
+import random
 # -----------------------
 # 預設設定（改這裡就好）
 # -----------------------
@@ -63,15 +64,41 @@ def find_image_path(img_dir: str, frame_id: str) -> Optional[str]:
 # ---------------------------------------------------------------------
 # 畫框
 # ---------------------------------------------------------------------
-def draw_boxes_on_image(img_bgr, bboxes: List[BBox], color=(0, 255, 0), thickness=2):
+def draw_boxes_on_image(img_bgr, bboxes: List[BBox], thickness=2, alpha=0.25):
+    """
+    在圖片上畫隨機三色的淡色半透明 bbox
+    - 顏色隨機從三個淺色池挑選
+    - alpha 控制透明度
+    """
+    overlay = img_bgr.copy()
     h_img, w_img = img_bgr.shape[:2]
+
+    # 三種固定的淺色 (BGR)
+    pastel_colors = [
+        (255, 200, 200),  # 淺粉紅
+        (200, 255, 255),  # 淺青藍
+        (200, 220, 255),  # 淺藍紫
+    ]
+
     for (l, t, w, h) in bboxes:
         x1, y1 = l, t
         x2, y2 = l + w, t + h
-        # 裁切避免超框
+
+        # 確保不超出邊界
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(w_img - 1, x2), min(h_img - 1, y2)
-        cv2.rectangle(img_bgr, (x1, y1), (x2, y2), color, thickness)
+
+        # 隨機選一個顏色
+        box_color = random.choice(pastel_colors)
+
+        # 畫半透明矩形
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), box_color, -1)
+
+        # 邊框線條
+        cv2.rectangle(img_bgr, (x1, y1), (x2, y2), box_color, thickness)
+
+    # 疊加半透明效果
+    cv2.addWeighted(overlay, alpha, img_bgr, 1 - alpha, 0, img_bgr)
     return img_bgr
 
 
