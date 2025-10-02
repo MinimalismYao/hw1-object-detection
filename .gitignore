@@ -1,0 +1,16 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Data
+data/train/
+data/test/
+data/*.zip
+
+# Logs
+experiments/logs/
+runs/
+
+# Virtual env
+.venv/
+env/
