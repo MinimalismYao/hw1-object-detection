@@ -109,6 +109,6 @@ python src/infer_to_csv.py --checkpoint experiments/logs/best_model.pth --out su
 
 * 學校：`NTUT`
 * 學號：`114408051`
-* 課程：TAICA - Additive Manufacturing & Computer Vision
+* 課程：TAICA - CVPDL
 
 
