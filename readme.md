@@ -25,6 +25,7 @@ hw1_<student-id>/
 │   ├── train.py                 # 訓練流程
 │   ├── eval.py                  # 驗證 mAP50:95
 │   ├── infer_to_csv.py          # 推論並輸出 Kaggle CSV
+│   ├── vis_gt.py                # 利用視覺化驗證 gt.txt 
 │   └── utils.py                 # 小工具 (IoU、可視化等)
 │
 ├── experiments/                 # 實驗設定與紀錄
