@@ -81,7 +81,7 @@ def main():
     os.makedirs("experiments/logs", exist_ok=True)
 
     # === 正式訓練 ===
-    for epoch in range(12):
+    for epoch in range(6):
         loss = train_one_epoch(model, train_loader, optimizer, device)
         print(f"[Epoch {epoch:02d}] loss={loss:.4f}")
         scheduler.step()
