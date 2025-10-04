@@ -54,47 +54,37 @@ def run_infer_to_strings(model, img_dir, score_thr=0.05, device=None):
     device = device or DEVICE
     tfm = torchvision.transforms.ToTensor()
 
+    # 1) 蒐集並用檔名排序（不做 int 轉換）
     img_files = []
     for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp"):
         img_files.extend(glob.glob(os.path.join(img_dir, ext)))
+    img_files = sorted(img_files)  # ← 直接字串排序即可
 
-    def _key(fp):
-        base = os.path.splitext(os.path.basename(fp))[0]
-        try: return int(base)
-        except ValueError: return base
-
-    img_files = sorted(img_files, key=_key)
     if MAX_IMAGES is not None:
         img_files = img_files[:MAX_IMAGES]
 
     rows = []
     pbar = tqdm(img_files, desc="Infer", ncols=100)
-    torch.backends.cudnn.benchmark = True  # ★ 加速卷積
-    # 可選：限制 CPU 執行緒，避免和其他程式打架
-    # torch.set_num_threads(1)
+    torch.backends.cudnn.benchmark = True
 
     for fp in pbar:
-        fname = os.path.basename(fp)
-        fid_str = os.path.splitext(fname)[0]
-        try:
-            fid = int(fid_str)
-        except ValueError:
-            continue
+        # 2) Image_ID 用「檔名字串」，不轉 int、不跳過
+        fid = os.path.splitext(os.path.basename(fp))[0]
 
         img, (orig_w, orig_h) = load_image(fp)
         x = tfm(img).to(device).unsqueeze(0)
 
         t0 = time.perf_counter()
-        # ★ AMP 自動混合精度（GPU 上會更快）
         with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
             out = model(x)[0]
-        torch.cuda.synchronize() if device.type == "cuda" else None
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         pbar.set_postfix(sec=f"{(time.perf_counter()-t0):.3f}")
 
         boxes  = out["boxes"].detach().cpu().numpy()
         scores = out["scores"].detach().cpu().numpy()
 
-        # 過濾 + 按分數排序 + 取前 MAX_DETS
+        # 3) 分數過濾 + 依分數降序 + 取前 MAX_DETS
         keep = scores >= score_thr
         boxes, scores = boxes[keep], scores[keep]
         order = scores.argsort()[::-1]
@@ -102,9 +92,9 @@ def run_infer_to_strings(model, img_dir, score_thr=0.05, device=None):
             order = order[:MAX_DETS]
         boxes, scores = boxes[order], scores[order]
 
-        # xyxy -> xywh + 裁邊
-        boxes[:, [0,2]] = boxes[:, [0,2]].clip(0, orig_w - 1)
-        boxes[:, [1,3]] = boxes[:, [1,3]].clip(0, orig_h - 1)
+        # 4) xyxy → xywh 並裁邊
+        boxes[:, [0, 2]] = boxes[:, [0, 2]].clip(0, orig_w - 1)
+        boxes[:, [1, 3]] = boxes[:, [1, 3]].clip(0, orig_h - 1)
         xywh = boxes.copy()
         xywh[:, 2] = (boxes[:, 2] - boxes[:, 0]).clip(min=0.0)
         xywh[:, 3] = (boxes[:, 3] - boxes[:, 1]).clip(min=0.0)
@@ -120,13 +110,17 @@ def run_infer_to_strings(model, img_dir, score_thr=0.05, device=None):
                 f"{float(b[1]):.2f}",
                 f"{w:.2f}",
                 f"{h:.2f}",
-                "0"
+                "0"  # 單一類別
             ])
         pred_str = " ".join(parts)
         rows.append((fid, pred_str))
 
+    # 5) 以檔名字串排序，並做基本檢查
     rows.sort(key=lambda x: x[0])
+    assert len(rows) == len(img_files), "行數與測試影像數不一致"
+    assert len({r[0] for r in rows}) == len(rows), "Image_ID 有重複"
     return rows
+
 
 def write_submission(rows, out_csv):
     d = os.path.dirname(out_csv)
