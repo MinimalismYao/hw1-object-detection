@@ -7,38 +7,64 @@ from model import get_fasterrcnn_r50_fpn
 
 def train_one_epoch(model, loader, optimizer, device):
     model.train()
-    avg_loss = 0.0
+    total = 0.0
     for images, targets in loader:
         images = [img.to(device) for img in images]
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-        loss_dict = model(images, targets)
+
+        loss_dict = model(images, targets)        # dict: loss_classifier, loss_box_reg, loss_objectness, loss_rpn_box_reg
         loss = sum(loss_dict.values())
+
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        avg_loss += loss.item()
-    return avg_loss / max(1, len(loader))
+
+        total += loss.item()
+    return total / max(1, len(loader))
+
+def quick_sanity_check(model, device):
+    # 用 batch_size=1 快速測試 forward/backward 是否正常
+    ds = PigsDataset("data/train/img", "data/train/gt.txt",
+                     transforms=get_transforms(train=True, max_side=640))
+    loader = DataLoader(ds, batch_size=1, shuffle=True, num_workers=2, collate_fn=collate_fn)
+    model.train()
+    params = [p for p in model.parameters() if p.requires_grad]
+    optim = torch.optim.SGD(params, lr=0.01, momentum=0.9)
+    images, targets = next(iter(loader))
+    images = [images[0].to(device)]
+    targets = [{k: v.to(device) for k, v in targets[0].items()}]
+    loss = sum(model(images, targets).values())
+    optim.zero_grad()
+    loss.backward()
+    optim.step()
+    print(f"[Sanity] one-step OK, loss={loss.item():.4f}")
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_ds = PigsDataset(img_dir="data/train/img",
-                           gt_txt="data/train/gt.txt",
-                           transforms=get_transforms(train=True))
-    train_loader = DataLoader(train_ds, batch_size=1, shuffle=True,
-                              num_workers=2, collate_fn=collate_fn)
-
+    # === 模型 ===
     model = get_fasterrcnn_r50_fpn(num_classes=2, freeze_backbone=True).to(device)
 
+    # === Sanity Check（小 batch）===
+    quick_sanity_check(model, device)
+
+    # === 資料 ===
+    train_ds = PigsDataset("data/train/img", "data/train/gt.txt",
+                           transforms=get_transforms(train=True, max_side=800))
+    train_loader = DataLoader(train_ds, batch_size=4, shuffle=True,
+                              num_workers=4, collate_fn=collate_fn)
+
+    # === 優化器與學習率排程 ===
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.SGD(params, lr=0.005, momentum=0.9, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
 
     os.makedirs("experiments/logs", exist_ok=True)
 
-    for epoch in range(2):  # 先跑短一點驗證流程
+    # === 正式訓練 ===
+    for epoch in range(12):
         loss = train_one_epoch(model, train_loader, optimizer, device)
-        print(f"[Epoch {epoch}] loss={loss:.4f}")
+        print(f"[Epoch {epoch:02d}] loss={loss:.4f}")
         scheduler.step()
         torch.save(model.state_dict(), f"experiments/logs/fasterrcnn_r50fpn_e{epoch}.pth")
 
