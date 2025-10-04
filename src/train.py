@@ -132,7 +132,12 @@ def quick_sanity_check(model, device):
     """用 batch_size=1 快測 forward/backward 是否能跑通"""
     ds = PigsDataset("data/train/img", "data/train/gt.txt",
                      transforms=get_transforms(train=True, max_side=640))
-    loader = DataLoader(ds, batch_size=1, shuffle=True, num_workers=2, collate_fn=collate_fn)
+    loader = DataLoader(ds, batch_size=1, shuffle=True, 
+                        num_workers=6, 
+                        pin_memory=True, 
+                        persistent_workers=True, 
+                        prefetch_factor=4,
+                        collate_fn=collate_fn)
     model.train()
     params = [p for p in model.parameters() if p.requires_grad]
     optim = torch.optim.SGD(params, lr=0.01, momentum=0.9)
