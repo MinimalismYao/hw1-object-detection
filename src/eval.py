@@ -24,7 +24,7 @@ from model import get_fasterrcnn_r50_fpn
 
 
 # ========= 可自行修改的設定 =========
-CKPT_PATH   = "experiments/logs/fasterrcnn_r50fpn_e5.pth"        # 權重
+CKPT_PATH   = "experiments/logs/best_model.pth"        # 權重
 VAL_IMG_DIR = "data/val/img"                                     # 驗證影像資料夾
 VAL_GT_TXT  = "data/val/gt_val.txt"                              # 驗證標註 txt
 MAX_SIDE    = 800                                                # 評估時最長邊縮放
