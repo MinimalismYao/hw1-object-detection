@@ -12,6 +12,8 @@ Faster R-CNN + ResNet50-FPN（backbone 可選凍結）訓練腳本。
 資料位置假設：
   data/train/img    (影像)
   data/train/gt.txt (標註：frame,x,y,w,h)
+
+
 """
 
 import os
