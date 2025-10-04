@@ -36,7 +36,7 @@ WEIGHT_DECAY = 1e-4
 STEP_SIZE    = 5
 GAMMA        = 0.1
 FREEZE_BB    = False   # 是否凍結 ResNet50 backbone
-NUM_WORKERS  = 6       # 使用幾顆 CPU 讀資料
+NUM_WORKERS  = 8       # 使用幾顆 CPU 讀資料
 GRAD_CLIP    = 10.0    # 0 或 None 代表不裁剪
 
 CKPT_DIR     = "experiments/logs"
