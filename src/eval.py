@@ -24,13 +24,13 @@ from model import get_fasterrcnn_r50_fpn
 
 
 # ========= 可自行修改的設定 =========
-CKPT_PATH   = "experiments/logs/fasterrcnn_r50fpn_final_v1.pth"        # 權重
+CKPT_PATH   = "experiments/logs/fasterrcnn_r50fpn_final_v2.pth"        # 權重
 VAL_IMG_DIR = "data/val/img"                                     # 驗證影像資料夾
 VAL_GT_TXT  = "data/val/gt_val.txt"                              # 驗證標註 txt
-MAX_SIDE    = 800                                                # 評估時最長邊縮放
+MAX_SIDE    = 1024                                                # 評估時最長邊縮放
 SCORE_THR   = 0.05                                               # 篩選分數門檻
-OUT_TXT     = "experiments/eval_results/eval_results_v1.txt"     # 人類可讀摘要
-OUT_JSON    = "experiments/eval_results/eval_details_v1.json"    # 完整陣列（精確）
+OUT_TXT     = "experiments/eval_results/eval_results_v2.txt"     # 人類可讀摘要
+OUT_JSON    = "experiments/eval_results/eval_details_v2.json"    # 完整陣列（精確）
 # ===================================
 
 
