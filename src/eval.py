@@ -2,82 +2,101 @@
 # -*- coding: utf-8 -*-
 """
 eval.py
-對驗證集 (val) 進行推論並計算 mAP@50 與 mAP@50:95
-使用 pycocotools COCO API。
+在驗證集 (data/val/img + data/val/gt_val.txt) 上計算 mAP@50 與 mAP@50:95，
+並把「所有」 precision / recall 結果輸出到 experiments/ 目錄。
 
-需求：
-- pycocotools
-- torchvision
-- dataset.py / model.py / transforms.py (專案已有)
-
-輸出：
-- 結果印在螢幕
-- 存到 experiments/eval_results.txt
+不需要 COCO JSON，直接讀 gt_val.txt（格式: frame,x,y,w,h）。
 """
 
-import os, glob, torch, json
+import os, json, glob, math
+from typing import List, Dict, Tuple
+
 import numpy as np
+from PIL import Image
 from tqdm import tqdm
+
+import torch
+import torchvision
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
-from PIL import Image
 
-import torchvision
-from dataset import PigsDataset, collate_fn
-from transforms import get_transforms
 from model import get_fasterrcnn_r50_fpn
 
 
+# ========= 可自行修改的設定 =========
+CKPT_PATH   = "experiments/logs/fasterrcnn_r50fpn_e5.pth"  # 權重
+VAL_IMG_DIR = "data/val/img"                               # 驗證影像資料夾
+VAL_GT_TXT  = "data/val/gt_val.txt"                        # 驗證標註 txt
+MAX_SIDE    = 800                                          # 評估時最長邊縮放
+SCORE_THR   = 0.05                                         # 篩選分數門檻
+OUT_TXT     = "experiments/eval_results.txt"               # 人類可讀摘要
+OUT_JSON    = "experiments/eval_details.json"              # 完整陣列（精確）
+# ===================================
 
 
-# -----------------------------
-# 載入模型
-# -----------------------------
-def load_model(ckpt_path, device):
-    model = get_fasterrcnn_r50_fpn(num_classes=2, freeze_backbone=True).to(device)
-    state = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(state)
-    model.eval()
-    return model
-
-
-# -----------------------------
-# 建立 COCO GT dict
-# -----------------------------
-def build_coco_from_gt(gt_txt, img_dir):
-    images, annotations = [], []
-    ann_id, seen = 1, set()
-
+# ---------- 工具：讀取/建立 COCO GT ----------
+def _read_gt_txt(gt_txt: str) -> List[Tuple[int, int, int, int, int]]:
+    """讀取 gt_val.txt -> [(img_id, x, y, w, h), ...]"""
+    out = []
     with open(gt_txt, "r") as f:
         for line in f:
-            if not line.strip():
+            line = line.strip()
+            if not line:
                 continue
-            frame, l, t, w, h = [x.strip() for x in line.split(",")]
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) != 5:
+                # 異常行直接略過
+                continue
+            frame, l, t, w, h = parts
             img_id = int(float(frame))
-            file_name = f"{img_id:08d}.jpg"
+            l, t, w, h = map(int, (l, t, w, h))
+            if w <= 0 or h <= 0:
+                # 無效框略過
+                continue
+            out.append((img_id, l, t, w, h))
+    return out
 
-            if img_id not in seen:
-                with Image.open(os.path.join(img_dir, file_name)) as im:
-                    W, H = im.size
-                images.append({"id": img_id, "file_name": file_name,
-                               "width": W, "height": H})
-                seen.add(img_id)
 
-            bbox = [int(l), int(t), int(w), int(h)]
-            annotations.append({
-                "id": ann_id,
-                "image_id": img_id,
-                "category_id": 1,
-                "bbox": bbox,
-                "area": int(w) * int(h),
-                "iscrowd": 0,
-            })
-            ann_id += 1
+def build_coco_from_gt(gt_txt: str, img_dir: str) -> COCO:
+    """
+    由 gt_val.txt 動態建立 COCO 資料結構（無需 JSON 檔）。
+    - 會讀取每張影像尺寸 (PIL)
+    """
+    rows = _read_gt_txt(gt_txt)
+    images_map: Dict[int, Dict] = {}
+    annotations: List[Dict] = []
+
+    ann_id = 1
+    for (img_id, l, t, w, h) in rows:
+        file_name = f"{img_id:08d}.jpg"  # 依你的命名規則
+        if img_id not in images_map:
+            fp = os.path.join(img_dir, file_name)
+            if not os.path.isfile(fp):
+                # 若檔案不存在，嘗試萬用字元（保險）
+                hits = glob.glob(os.path.join(img_dir, f"{img_id:08d}.*"))
+                if not hits:
+                    # 這張 val 圖片缺失，整張略過（也不建立 ann）
+                    continue
+                fp = hits[0]
+                file_name = os.path.basename(fp)
+            with Image.open(fp) as im:
+                W, H = im.size
+            images_map[img_id] = {"id": img_id, "file_name": file_name, "width": W, "height": H}
+
+        annotations.append({
+            "id": ann_id,
+            "image_id": img_id,
+            "category_id": 1,            # 單類別：pig
+            "bbox": [l, t, w, h],        # COCO: [x,y,w,h]
+            "area": w * h,
+            "iscrowd": 0
+        })
+        ann_id += 1
 
     coco_dict = {
-        "info": {"description": "TAICA HW1 val"},
+        "info": {"description": "TAICA HW1 - Validation (from gt_val.txt)"},
         "licenses": [],
-        "images": images,
+        "images": list(images_map.values()),
         "annotations": annotations,
         "categories": [{"id": 1, "name": "pig"}],
     }
@@ -88,92 +107,165 @@ def build_coco_from_gt(gt_txt, img_dir):
     return coco_gt
 
 
-# -----------------------------
-# 推論並轉 COCO 格式
-# -----------------------------
-@torch.inference_mode()
-def infer_and_build_dt(model, img_dir, device, max_side=800, score_thr=0.05):
-    tfm = torchvision.transforms.Compose([
-    torchvision.transforms.ToTensor()])
+# ---------- 模型 ----------
+def load_model(ckpt_path: str, device: torch.device):
+    model = get_fasterrcnn_r50_fpn(num_classes=2, freeze_backbone=True).to(device)
+    # 安全載入權重（新舊 torch 皆可）
+    try:
+        state = torch.load(ckpt_path, map_location=device, weights_only=True)
+    except TypeError:
+        state = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(state)
+    model.eval()
+    return model
 
-    img_files = sorted(glob.glob(os.path.join(img_dir, "*.jpg")))
+
+# ---------- 推論並轉成 COCO DT 清單 ----------
+@torch.inference_mode()
+def infer_to_coco_dt(model, coco_gt: COCO, img_dir: str, device: torch.device,
+                     max_side: int = 800, score_thr: float = 0.05):
+    tfm = torchvision.transforms.Compose([torchvision.transforms.ToTensor()])
+
+    img_ids = sorted(coco_gt.getImgIds())
     results = []
 
-    for fp in tqdm(img_files, desc="Infer", ncols=100):
-        fname = os.path.basename(fp)
-        fid = int(os.path.splitext(fname)[0])
+    for img_id in tqdm(img_ids, desc="Infer", ncols=100):
+        info = coco_gt.loadImgs(img_id)[0]
+        file_name = info["file_name"]
+        fp = os.path.join(img_dir, file_name)
+        if not os.path.isfile(fp):
+            # 萬用字元補救
+            hits = glob.glob(os.path.join(img_dir, os.path.splitext(file_name)[0] + ".*"))
+            if not hits:
+                continue
+            fp = hits[0]
 
         img = Image.open(fp).convert("RGB")
         W, H = img.size
         scale = min(1.0, float(max_side) / max(W, H))
         if scale < 1.0:
-            new_w, new_h = int(W * scale), int(H * scale)
+            new_w, new_h = int(round(W * scale)), int(round(H * scale))
             img = img.resize((new_w, new_h), resample=Image.BILINEAR)
 
-        x = torchvision.transforms.ToTensor()(img).to(device).unsqueeze(0)
+        x = tfm(img).to(device).unsqueeze(0)
         out = model(x)[0]
 
         boxes = out["boxes"].detach().cpu().numpy()
         scores = out["scores"].detach().cpu().numpy()
 
+        # 還原座標
         if scale < 1.0:
             inv = 1.0 / scale
             boxes[:, [0, 2]] *= inv
             boxes[:, [1, 3]] *= inv
 
+        # 過濾分數
         keep = scores >= score_thr
         boxes, scores = boxes[keep], scores[keep]
 
+        # 轉 COCO bbox
         for b, s in zip(boxes, scores):
-            x1, y1, x2, y2 = b
-            w, h = x2 - x1, y2 - y1
-            if w <= 0 or h <= 0:
+            x1, y1, x2, y2 = [float(v) for v in b]
+            w_box, h_box = max(0.0, x2 - x1), max(0.0, y2 - y1)
+            if w_box <= 0.0 or h_box <= 0.0:
                 continue
             results.append({
-                "image_id": fid,
+                "image_id": img_id,
                 "category_id": 1,
-                "bbox": [float(x1), float(y1), float(w), float(h)],
+                "bbox": [x1, y1, w_box, h_box],
                 "score": float(s),
             })
 
     return results
 
 
-# -----------------------------
-# 主程式
-# -----------------------------
+# ---------- 將 COCOeval 結果完整寫檔 ----------
+def dump_cocoeval(coco_eval: COCOeval, out_txt: str, out_json: str):
+    os.makedirs(os.path.dirname(out_txt), exist_ok=True)
+
+    # 1) 人類可讀摘要
+    with open(out_txt, "w") as f:
+        f.write("===== COCO Evaluation Summary =====\n\n")
+        # 將 summarize() 的輸出複製到檔案
+        metrics = [
+            "AP @[ IoU=0.50:0.95 | area=all | maxDets=100 ]",
+            "AP @[ IoU=0.50      | area=all | maxDets=100 ]",
+            "AP @[ IoU=0.75      | area=all | maxDets=100 ]",
+            "AP @[ IoU=0.50:0.95 | area=small | maxDets=100 ]",
+            "AP @[ IoU=0.50:0.95 | area=medium | maxDets=100 ]",
+            "AP @[ IoU=0.50:0.95 | area=large | maxDets=100 ]",
+            "AR @[ IoU=0.50:0.95 | area=all | maxDets=1 ]",
+            "AR @[ IoU=0.50:0.95 | area=all | maxDets=10 ]",
+            "AR @[ IoU=0.50:0.95 | area=all | maxDets=100 ]",
+            "AR @[ IoU=0.50:0.95 | area=small | maxDets=100 ]",
+            "AR @[ IoU=0.50:0.95 | area=medium | maxDets=100 ]",
+            "AR @[ IoU=0.50:0.95 | area=large | maxDets=100 ]",
+        ]
+        for i, m in enumerate(metrics):
+            f.write(f"{m:<70} = {coco_eval.stats[i]:.6f}\n")
+
+        # 附解讀指南
+        f.write("\n[說明]\n")
+        f.write("- AP: 平均精度；AR: 平均召回；主指標為 AP@[0.50:0.95]（COCO 標準）。\n")
+        f.write("- precision 的維度為 [IoU x recall x category x area x maxDets]。\n")
+        f.write("- recall    的維度為 [IoU x category x area x maxDets]（每個 IoU 的最大可達召回）。\n")
+        f.write("- 詳細陣列請見 eval_details.json（可用來畫曲線）。\n")
+
+    # 2) 完整 precision / recall 陣列 + 參數軸（JSON）
+    def _np(v):
+        return None if v is None else v.tolist()
+
+    details = {
+        "precision": _np(coco_eval.eval["precision"]),  # shape: [T,R,K,A,M]
+        "recall": _np(coco_eval.eval["recall"]),        # shape: [T,K,A,M]
+        "scores": _np(coco_eval.eval["scores"]),        # shape: [T,R,K,A,M]
+        "params": {
+            "iouThrs": _np(coco_eval.params.iouThrs),   # len T
+            "recThrs": _np(coco_eval.params.recThrs),   # len R
+            "catIds": _np(coco_eval.params.catIds),     # 我們只有一類
+            "areaRngLbl": coco_eval.params.areaRngLbl,  # ["all","small","medium","large"]
+            "maxDets": coco_eval.params.maxDets,        # [1,10,100]
+        },
+    }
+    with open(out_json, "w") as f:
+        json.dump(details, f, indent=2)
+
+    print(f"[Done] Results saved to:\n  - {out_txt}\n  - {out_json}")
+
+
+# ---------- 主流程 ----------
 def main():
+    # 檢查路徑
+    if not os.path.isfile(CKPT_PATH):
+        raise FileNotFoundError(CKPT_PATH)
+    if not os.path.isdir(VAL_IMG_DIR):
+        raise FileNotFoundError(VAL_IMG_DIR)
+    if not os.path.isfile(VAL_GT_TXT):
+        raise FileNotFoundError(VAL_GT_TXT)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt = "experiments/logs/fasterrcnn_r50fpn_e5.pth"   # 👈 你可以改成想要的權重
-    img_dir = "data/val/img"
-    gt_txt = "data/val/gt_val.txt"
+    torch.backends.cudnn.benchmark = True
 
-    if not os.path.isfile(ckpt):
-        raise FileNotFoundError(ckpt)
+    # 1) 準備 GT
+    coco_gt = build_coco_from_gt(VAL_GT_TXT, VAL_IMG_DIR)
 
-    model = load_model(ckpt, device)
+    # 2) 載入模型
+    model = load_model(CKPT_PATH, device)
 
-    # === 建 GT ===
-    coco_gt = build_coco_from_gt(gt_txt, img_dir)
+    # 3) 推論 → COCO DT
+    coco_dt_list = infer_to_coco_dt(model, coco_gt, VAL_IMG_DIR, device,
+                                    max_side=MAX_SIDE, score_thr=SCORE_THR)
 
-    # === 建 DT ===
-    coco_dt_list = infer_and_build_dt(model, img_dir, device)
+    # 4) COCO 評估
     coco_dt = coco_gt.loadRes(coco_dt_list)
-
-    # === Eval ===
     coco_eval = COCOeval(coco_gt, coco_dt, iouType="bbox")
     coco_eval.evaluate()
     coco_eval.accumulate()
-    coco_eval.summarize()
+    coco_eval.summarize()  # 會印在終端機
 
-    m50 = coco_eval.stats[1]   # mAP@50
-    m5095 = coco_eval.stats[0] # mAP@50:95
-
-    out_path = "experiments/eval_results.txt"
-    with open(out_path, "w") as f:
-        f.write(f"mAP@50: {m50:.4f}\n")
-        f.write(f"mAP@50:95: {m5095:.4f}\n")
-    print(f"[Done] Results saved to {out_path}")
+    # 5) 存檔（摘要 + 完整陣列）
+    os.makedirs(os.path.dirname(OUT_TXT), exist_ok=True)
+    dump_cocoeval(coco_eval, OUT_TXT, OUT_JSON)
 
 
 if __name__ == "__main__":
