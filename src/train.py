@@ -35,9 +35,9 @@ LR           = 0.003
 WEIGHT_DECAY = 1e-4
 STEP_SIZE    = 5
 GAMMA        = 0.1
-FREEZE_BB    = False                      # 是否凍結 ResNet50 backbone
-NUM_WORKERS  = 6
-GRAD_CLIP    = 10.0                      # 0 或 None 代表不裁剪
+FREEZE_BB    = False   # 是否凍結 ResNet50 backbone
+NUM_WORKERS  = 6       # 使用幾顆 CPU 讀資料
+GRAD_CLIP    = 10.0    # 0 或 None 代表不裁剪
 
 CKPT_DIR     = "experiments/logs"
 CKPT_NAME    = "fasterrcnn_r50fpn_final_v2.pth"   # 只保存最後一個
