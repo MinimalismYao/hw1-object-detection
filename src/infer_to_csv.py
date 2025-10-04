@@ -21,8 +21,8 @@ from model import get_fasterrcnn_r50_fpn
 
 # ========= 可自行修改的設定 =========
 IMG_DIR     = "data/test/img"                             # 要推論的影像資料夾
-CKPT_PATH   = "experiments/logs/fasterrcnn_r50fpn_e5.pth" # 權重檔
-OUT_CSV     = "submission.csv"                            # 輸出檔名
+CKPT_PATH   = "experiments/logs/fasterrcnn_r50fpn_final_v1.pth" # 權重檔
+OUT_CSV     = "submission_v1.csv"                            # 輸出檔名
 MAX_SIDE    = 800                                         # 推論時最長邊縮放
 SCORE_THR   = 0.10                                        # 分數閾值
 MAX_IMAGES  = None                                        # 限制最多推論幾張（None 表示全部）
