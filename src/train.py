@@ -10,8 +10,8 @@ from transforms import get_transforms
 from model import get_fasterrcnn_r50_fpn
 
 
-# ========= 這裡直接修改即可 =========
-EPOCHS      = 2
+# ========= 可自行修改的設定 =========
+EPOCHS      = 6
 BATCH_SIZE  = 4
 MAX_SIDE    = 800
 LR          = 0.005
@@ -19,7 +19,7 @@ WEIGHT_DECAY= 1e-4
 STEP_SIZE   = 5
 GAMMA       = 0.1
 CKPT_DIR    = "experiments/logs"
-CKPT_PREFIX = "fasterrcnn_r50fpn"   # 權重檔名前綴
+CKPT_NAME   = "fasterrcnn_r50fpn_final.pth"   # 只保存最後一個權重
 # ==================================
 
 
@@ -44,7 +44,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch, grad_clip=10.0):
     s_box     = SmoothedValue(0.9)
 
     epoch_t0 = time.perf_counter()
-    pbar = tqdm(loader, total=len(loader), ncols=120, desc=f"Epoch {epoch:02d}")
+    pbar = tqdm(loader, total=len(loader), ncols=120, desc=f"Epoch {epoch+1}/{EPOCHS}")
 
     for images, targets in pbar:
         bt0 = time.perf_counter()
@@ -54,20 +54,13 @@ def train_one_epoch(model, loader, optimizer, device, epoch, grad_clip=10.0):
 
         loss_dict = model(images, targets)
 
-        bad = False
-        for k, v in loss_dict.items():
-            if not torch.isfinite(v):
-                ids = [int(t.get("image_id", torch.tensor(-1)).item()) for t in targets]
-                print(f"[Warn] {k} is {v.item()} on images {ids}. Skip batch.")
-                bad = True
-                break
-        if bad:
+        if any([not torch.isfinite(v) for v in loss_dict.values()]):
+            print(f"[Warn] Non-finite loss, skip batch.")
             continue
 
         loss = sum(loss_dict.values())
         if not torch.isfinite(loss):
-            ids = [int(t.get("image_id", torch.tensor(-1)).item()) for t in targets]
-            print(f"[Warn] total loss is NaN/Inf on images {ids}. Skip.")
+            print(f"[Warn] total loss is NaN/Inf, skip batch.")
             continue
 
         optimizer.zero_grad()
@@ -102,7 +95,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch, grad_clip=10.0):
 
     epoch_time = time.perf_counter() - epoch_t0
     avg_loss = total_loss / max(1, num_batches)
-    print(f"[Epoch {epoch:02d}] avg_loss={avg_loss:.4f} | time={epoch_time:.1f}s")
+    print(f"[Epoch {epoch+1}/{EPOCHS}] avg_loss={avg_loss:.4f} | time={epoch_time:.1f}s")
     return avg_loss
 
 
@@ -146,9 +139,10 @@ def main():
         avg_loss = train_one_epoch(model, train_loader, optimizer, device, epoch)
         scheduler.step()
 
-        ckpt_path = os.path.join(CKPT_DIR, f"{CKPT_PREFIX}_e{epoch}.pth")
-        torch.save(model.state_dict(), ckpt_path)
-        print(f"[Save] {ckpt_path}")
+    # 只存最後一個
+    ckpt_path = os.path.join(CKPT_DIR, CKPT_NAME)
+    torch.save(model.state_dict(), ckpt_path)
+    print(f"[Save Final] {ckpt_path}")
 
 
 if __name__ == "__main__":
