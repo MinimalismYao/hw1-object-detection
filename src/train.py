@@ -36,7 +36,7 @@ WEIGHT_DECAY = 1e-4
 STEP_SIZE    = 5
 GAMMA        = 0.1
 FREEZE_BB    = False                      # 是否凍結 ResNet50 backbone
-NUM_WORKERS  = 4
+NUM_WORKERS  = 6
 GRAD_CLIP    = 10.0                      # 0 或 None 代表不裁剪
 
 CKPT_DIR     = "experiments/logs"
@@ -165,7 +165,9 @@ def main():
     train_ds = PigsDataset("data/train/img", "data/train/gt.txt",
                            transforms=get_transforms(train=True, max_side=MAX_SIDE))
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
-                              num_workers=NUM_WORKERS, collate_fn=collate_fn)
+                              num_workers=NUM_WORKERS, pin_memory=True, 
+                              persistent_workers=True, prefetch_factor=4, 
+                              collate_fn=collate_fn)
 
     # === 優化器與學習率排程 ===
     params    = [p for p in model.parameters() if p.requires_grad]
