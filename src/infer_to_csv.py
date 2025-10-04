@@ -125,18 +125,34 @@ def parse_args():
     return p.parse_args()
 
 def main():
+    # 內建預設（可改）
+    DEFAULT_CKPT = "experiments/logs/fasterrcnn_r50fpn_e5.pth"
+    DEFAULT_IMG  = "data/test/img"
+    DEFAULT_OUT  = "submission.csv"
+    DEFAULT_MAX  = 800
+    DEFAULT_THR  = 0.10
+
     args = parse_args()
+    ckpt = args.checkpoint or DEFAULT_CKPT
+    imgd = args.img_dir   or DEFAULT_IMG
+    outc = args.out       or DEFAULT_OUT
+    mside = args.max_side if args.max_side else DEFAULT_MAX
+    thr   = args.score_thr if args.score_thr is not None else DEFAULT_THR
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.backends.cudnn.benchmark = True  # 動態最佳化卷積
+    torch.backends.cudnn.benchmark = True
 
-    if not os.path.isfile(args.checkpoint):
-        raise FileNotFoundError(args.checkpoint)
+    if not os.path.isfile(ckpt):
+        raise FileNotFoundError(ckpt)
+    if not os.path.isdir(imgd):
+        raise FileNotFoundError(imgd)
 
-    model = load_model(args.checkpoint, device)
-    rows = run_infer_to_strings(model, args.img_dir,
-                                max_side=args.max_side, score_thr=args.score_thr, device=device)
-    write_submission(rows, args.out)
-    print(f"[Done] Wrote submission to: {args.out}")
+    model = load_model(ckpt, device)
+    rows = run_infer_to_strings(model, imgd, max_side=mside, score_thr=thr, device=device)
+    write_submission(rows, outc)
+    print(f"[Done] Wrote submission to: {outc}")
+
+
 
 if __name__ == "__main__":
     main()
