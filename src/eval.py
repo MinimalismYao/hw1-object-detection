@@ -93,7 +93,9 @@ def build_coco_from_gt(gt_txt, img_dir):
 # -----------------------------
 @torch.inference_mode()
 def infer_and_build_dt(model, img_dir, device, max_side=800, score_thr=0.05):
-    tfm = torch.nn.Sequential(torchvision.transforms.ToTensor())
+    tfm = torchvision.transforms.Compose([
+    torchvision.transforms.ToTensor()])
+
     img_files = sorted(glob.glob(os.path.join(img_dir, "*.jpg")))
     results = []
 
