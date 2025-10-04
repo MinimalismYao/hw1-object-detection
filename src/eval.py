@@ -8,7 +8,7 @@ eval.py
 不需要 COCO JSON，直接讀 gt_val.txt（格式: frame,x,y,w,h）。
 """
 
-import os, json, glob, math
+import os, json, glob
 from typing import List, Dict, Tuple
 
 import numpy as np
@@ -24,13 +24,13 @@ from model import get_fasterrcnn_r50_fpn
 
 
 # ========= 可自行修改的設定 =========
-CKPT_PATH   = "experiments/logs/fasterrcnn_r50fpn_e5.pth"  # 權重
-VAL_IMG_DIR = "data/val/img"                               # 驗證影像資料夾
-VAL_GT_TXT  = "data/val/gt_val.txt"                        # 驗證標註 txt
-MAX_SIDE    = 800                                          # 評估時最長邊縮放
-SCORE_THR   = 0.05                                         # 篩選分數門檻
-OUT_TXT     = "experiments/eval_results.txt"               # 人類可讀摘要
-OUT_JSON    = "experiments/eval_details.json"              # 完整陣列（精確）
+CKPT_PATH   = "experiments/logs/fasterrcnn_r50fpn_e5.pth"        # 權重
+VAL_IMG_DIR = "data/val/img"                                     # 驗證影像資料夾
+VAL_GT_TXT  = "data/val/gt_val.txt"                              # 驗證標註 txt
+MAX_SIDE    = 800                                                # 評估時最長邊縮放
+SCORE_THR   = 0.05                                               # 篩選分數門檻
+OUT_TXT     = "experiments/eval_results/eval_results_e5.txt"     # 人類可讀摘要
+OUT_JSON    = "experiments/eval_results/eval_details_e5.json"    # 完整陣列（精確）
 # ===================================
 
 
@@ -45,13 +45,11 @@ def _read_gt_txt(gt_txt: str) -> List[Tuple[int, int, int, int, int]]:
                 continue
             parts = [p.strip() for p in line.split(",")]
             if len(parts) != 5:
-                # 異常行直接略過
                 continue
             frame, l, t, w, h = parts
             img_id = int(float(frame))
             l, t, w, h = map(int, (l, t, w, h))
             if w <= 0 or h <= 0:
-                # 無效框略過
                 continue
             out.append((img_id, l, t, w, h))
     return out
@@ -72,10 +70,9 @@ def build_coco_from_gt(gt_txt: str, img_dir: str) -> COCO:
         if img_id not in images_map:
             fp = os.path.join(img_dir, file_name)
             if not os.path.isfile(fp):
-                # 若檔案不存在，嘗試萬用字元（保險）
                 hits = glob.glob(os.path.join(img_dir, f"{img_id:08d}.*"))
                 if not hits:
-                    # 這張 val 圖片缺失，整張略過（也不建立 ann）
+                    # 找不到影像就略過該影像的標註
                     continue
                 fp = hits[0]
                 file_name = os.path.basename(fp)
@@ -134,7 +131,6 @@ def infer_to_coco_dt(model, coco_gt: COCO, img_dir: str, device: torch.device,
         file_name = info["file_name"]
         fp = os.path.join(img_dir, file_name)
         if not os.path.isfile(fp):
-            # 萬用字元補救
             hits = glob.glob(os.path.join(img_dir, os.path.splitext(file_name)[0] + ".*"))
             if not hits:
                 continue
@@ -186,7 +182,6 @@ def dump_cocoeval(coco_eval: COCOeval, out_txt: str, out_json: str):
     # 1) 人類可讀摘要
     with open(out_txt, "w") as f:
         f.write("===== COCO Evaluation Summary =====\n\n")
-        # 將 summarize() 的輸出複製到檔案
         metrics = [
             "AP @[ IoU=0.50:0.95 | area=all | maxDets=100 ]",
             "AP @[ IoU=0.50      | area=all | maxDets=100 ]",
@@ -204,7 +199,6 @@ def dump_cocoeval(coco_eval: COCOeval, out_txt: str, out_json: str):
         for i, m in enumerate(metrics):
             f.write(f"{m:<70} = {coco_eval.stats[i]:.6f}\n")
 
-        # 附解讀指南
         f.write("\n[說明]\n")
         f.write("- AP: 平均精度；AR: 平均召回；主指標為 AP@[0.50:0.95]（COCO 標準）。\n")
         f.write("- precision 的維度為 [IoU x recall x category x area x maxDets]。\n")
@@ -212,21 +206,35 @@ def dump_cocoeval(coco_eval: COCOeval, out_txt: str, out_json: str):
         f.write("- 詳細陣列請見 eval_details.json（可用來畫曲線）。\n")
 
     # 2) 完整 precision / recall 陣列 + 參數軸（JSON）
-    def _np(v):
-        return None if v is None else v.tolist()
+    def _to_py(v):
+        """把 numpy / tensor / 其他可迭代物 轉成原生 Python 結構"""
+        if v is None:
+            return None
+        # numpy / torch 都優先嘗試 tolist
+        if hasattr(v, "tolist"):
+            try:
+                return v.tolist()
+            except Exception:
+                pass
+        # list/tuple/set 直接展平成 list
+        if isinstance(v, (list, tuple, set)):
+            return list(v)
+        # 其他標量
+        return v
 
     details = {
-        "precision": _np(coco_eval.eval["precision"]),  # shape: [T,R,K,A,M]
-        "recall": _np(coco_eval.eval["recall"]),        # shape: [T,K,A,M]
-        "scores": _np(coco_eval.eval["scores"]),        # shape: [T,R,K,A,M]
+        "precision": _to_py(coco_eval.eval.get("precision")),  # shape: [T,R,K,A,M]
+        "recall":    _to_py(coco_eval.eval.get("recall")),     # shape: [T,K,A,M]
+        "scores":    _to_py(coco_eval.eval.get("scores")),     # shape: [T,R,K,A,M]
         "params": {
-            "iouThrs": _np(coco_eval.params.iouThrs),   # len T
-            "recThrs": _np(coco_eval.params.recThrs),   # len R
-            "catIds": _np(coco_eval.params.catIds),     # 我們只有一類
-            "areaRngLbl": coco_eval.params.areaRngLbl,  # ["all","small","medium","large"]
-            "maxDets": coco_eval.params.maxDets,        # [1,10,100]
+            "iouThrs":    _to_py(coco_eval.params.iouThrs),    # len T
+            "recThrs":    _to_py(coco_eval.params.recThrs),    # len R
+            "catIds":     _to_py(coco_eval.params.catIds),     # 我們只有一類
+            "areaRngLbl": _to_py(coco_eval.params.areaRngLbl), # ["all","small","medium","large"]
+            "maxDets":    _to_py(coco_eval.params.maxDets),    # [1,10,100]
         },
     }
+    os.makedirs(os.path.dirname(out_json), exist_ok=True)
     with open(out_json, "w") as f:
         json.dump(details, f, indent=2)
 

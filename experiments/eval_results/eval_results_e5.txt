@@ -1,17 +1,17 @@
 ===== COCO Evaluation Summary =====
 
-AP @[ IoU=0.50:0.95 | area=all | maxDets=100 ]                         = 0.000561
-AP @[ IoU=0.50      | area=all | maxDets=100 ]                         = 0.003421
-AP @[ IoU=0.75      | area=all | maxDets=100 ]                         = 0.000050
+AP @[ IoU=0.50:0.95 | area=all | maxDets=100 ]                         = 0.000572
+AP @[ IoU=0.50      | area=all | maxDets=100 ]                         = 0.003461
+AP @[ IoU=0.75      | area=all | maxDets=100 ]                         = 0.000058
 AP @[ IoU=0.50:0.95 | area=small | maxDets=100 ]                       = 0.000000
-AP @[ IoU=0.50:0.95 | area=medium | maxDets=100 ]                      = 0.000407
-AP @[ IoU=0.50:0.95 | area=large | maxDets=100 ]                       = 0.002813
+AP @[ IoU=0.50:0.95 | area=medium | maxDets=100 ]                      = 0.000422
+AP @[ IoU=0.50:0.95 | area=large | maxDets=100 ]                       = 0.002842
 AR @[ IoU=0.50:0.95 | area=all | maxDets=1 ]                           = 0.000000
 AR @[ IoU=0.50:0.95 | area=all | maxDets=10 ]                          = 0.000104
-AR @[ IoU=0.50:0.95 | area=all | maxDets=100 ]                         = 0.023127
+AR @[ IoU=0.50:0.95 | area=all | maxDets=100 ]                         = 0.023593
 AR @[ IoU=0.50:0.95 | area=small | maxDets=100 ]                       = 0.000000
-AR @[ IoU=0.50:0.95 | area=medium | maxDets=100 ]                      = 0.015616
-AR @[ IoU=0.50:0.95 | area=large | maxDets=100 ]                       = 0.090746
+AR @[ IoU=0.50:0.95 | area=medium | maxDets=100 ]                      = 0.016140
+AR @[ IoU=0.50:0.95 | area=large | maxDets=100 ]                       = 0.091022
 
 [說明]
 - AP: 平均精度；AR: 平均召回；主指標為 AP@[0.50:0.95]（COCO 標準）。
