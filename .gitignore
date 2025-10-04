@@ -17,6 +17,7 @@ venv/
 data/train/
 data/test/
 data/*.zip
+data/val
 
 # ---- 訓練與驗證 log (tensorboard, checkpoint)，檔案通常很大 ----
 experiments/logs/
