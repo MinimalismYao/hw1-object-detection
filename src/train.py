@@ -11,7 +11,7 @@ from model import get_fasterrcnn_r50_fpn
 
 
 # ========= 可自行修改的設定 =========
-EPOCHS      = 6
+EPOCHS      = 1
 BATCH_SIZE  = 4
 MAX_SIDE    = 800
 LR          = 0.005
