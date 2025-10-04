@@ -11,7 +11,7 @@ from model import get_fasterrcnn_r50_fpn
 
 
 # ========= 可自行修改的設定 =========
-EPOCHS      = 1
+EPOCHS      = 30
 BATCH_SIZE  = 4
 MAX_SIDE    = 800
 LR          = 0.005
@@ -19,7 +19,7 @@ WEIGHT_DECAY= 1e-4
 STEP_SIZE   = 5
 GAMMA       = 0.1
 CKPT_DIR    = "experiments/logs"
-CKPT_NAME   = "fasterrcnn_r50fpn_final.pth"   # 只保存最後一個權重
+CKPT_NAME   = "fasterrcnn_r50fpn_final_v1.pth"   # 只保存最後一個權重
 # ==================================
 
 
