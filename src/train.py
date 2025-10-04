@@ -40,7 +40,7 @@ NUM_WORKERS  = 8       # 使用幾顆 CPU 讀資料
 GRAD_CLIP    = 10.0    # 0 或 None 代表不裁剪
 
 CKPT_DIR     = "experiments/logs"
-CKPT_NAME    = "fasterrcnn_r50fpn_final_v2.pth"   # 只保存最後一個
+CKPT_NAME    = "fasterrcnn_r50fpn_final_v3.pth"   # 只保存最後一個
 # ====================================
 
 
