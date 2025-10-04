@@ -1,136 +1,126 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-infer_to_csv.py
-Test set 推論 → 產生 Kaggle submission.csv
-格式（單一類別）: "score x y w h 0 ..."（0 是 class id）
-
-使用方式：
-  直接修改檔頭常數（CKPT_PATH, IMG_DIR, OUT_CSV, ...），然後執行：
-      python src/infer_to_csv.py
-"""
-
+# ==== 1) import 區補強 ====
 import os, csv, glob
+import time
 import torch
-import numpy as np
 from PIL import Image
 import torchvision
 from tqdm import tqdm
 
 from model import get_fasterrcnn_r50_fpn
 
-# ========= 可自行修改的設定 =========
-IMG_DIR     = "data/test/img"                             # 要推論的影像資料夾
-CKPT_PATH   = "experiments/logs/fasterrcnn_r50fpn_final_v2.pth" # 權重檔
-OUT_CSV     = "submission_v2.csv"                            # 輸出檔名
-MAX_SIDE    = 1024                                         # 推論時最長邊縮放
-SCORE_THR   = 0.10                                        # 分數閾值
-MAX_IMAGES  = None                                        # 限制最多推論幾張（None 表示全部）
-# ===================================
+# ==== 2) 參數（保持你原本邏輯；先把 MAX_SIDE 不用外部縮放，交給 model 限制）====
+IMG_DIR     = "data/test/img"
+CKPT_PATH   = "experiments/logs/fasterrcnn_r50fpn_final_v2.pth"
+OUT_CSV     = "submission_v2.csv"
+MAX_SIDE    = 1024           # 不外部縮放；用它來限制「模型內部 transform」的 max_size
+SCORE_THR   = 0.05           # 建議 0.05
+MAX_IMAGES  = None
+MAX_DETS    = 100            # 新增：每張最多保留 100
 
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# ==== 3) 載模型：確保 eval、GPU、限制 transform 尺寸、AMP 更快 ====
 def load_model(ckpt_path, device):
-    model = get_fasterrcnn_r50_fpn(num_classes=2, freeze_backbone=True).to(device)
-
-    # 載入權重（你存的是 state_dict）
+    model = get_fasterrcnn_r50_fpn(num_classes=2, freeze_backbone=False).to(device)
+    # weights_only=True 更安全也更快一點（若你是舊版 torch，沒這參數就拿掉）
     try:
         state = torch.load(ckpt_path, map_location=device, weights_only=True)
     except TypeError:
         state = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(state)
+    model.load_state_dict(state, strict=True)
     model.eval()
 
-    # （相容性保護）某些 torchvision 版本這些是 dict，有些是方法/物件
-    try:
-        pre_nms = getattr(model.rpn, "pre_nms_top_n", None)
-        post_nms = getattr(model.rpn, "post_nms_top_n", None)
-        if isinstance(pre_nms, dict) and isinstance(post_nms, dict):
-            pre_nms["testing"]  = min(3000, pre_nms.get("testing", 1000))
-            post_nms["testing"] = min(1000, post_nms.get("testing", 300))
-    except Exception:
-        pass
+    # ★ 關鍵：把模型內部 GeneralizedRCNNTransform 限制在我們想要的大小
+    #   這樣就算你餵「原圖」，模型也只會把短邊拉到 MAX_SIDE、長邊最多 MAX_SIDE
+    if hasattr(model, "transform"):
+        if MAX_SIDE is not None:
+            model.transform.min_size = (MAX_SIDE,)   # shorter side
+            model.transform.max_size = MAX_SIDE      # longer side cap
+        # 你訓練時若沒用 ImageNet normalize，推論也改成 0/1（和你自組版一致）
+        model.transform.image_mean = [0.0, 0.0, 0.0]
+        model.transform.image_std  = [1.0, 1.0, 1.0]
 
     return model
 
-
-def load_image(fp, max_side=800):
+# ==== 4) 讀圖：不要外部 resize ====
+def load_image(fp):
     img = Image.open(fp).convert("RGB")
     w, h = img.size
-    scale = min(1.0, float(max_side) / max(w, h))
-    if scale < 1.0:
-        new_w, new_h = int(round(w * scale)), int(round(h * scale))
-        img = img.resize((new_w, new_h), resample=Image.BILINEAR)
-    return img, (w, h), scale
+    return img, (w, h)  # 不縮放
 
-
+# ==== 5) 推論主程：加 tqdm、AMP、自動排序取 Top-100 ====
 @torch.inference_mode()
-def run_infer_to_strings(model, img_dir, max_side=800, score_thr=0.10, device=None):
-    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def run_infer_to_strings(model, img_dir, score_thr=0.05, device=None):
+    device = device or DEVICE
     tfm = torchvision.transforms.ToTensor()
 
-    # 支援多種副檔名
     img_files = []
     for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp"):
         img_files.extend(glob.glob(os.path.join(img_dir, ext)))
-    # 檔名以數字排序（00000001.jpg → 1）
+
     def _key(fp):
         base = os.path.splitext(os.path.basename(fp))[0]
-        try:
-            return int(base)
-        except ValueError:
-            return base
-    img_files = sorted(img_files, key=_key)
+        try: return int(base)
+        except ValueError: return base
 
+    img_files = sorted(img_files, key=_key)
     if MAX_IMAGES is not None:
         img_files = img_files[:MAX_IMAGES]
 
     rows = []
+    pbar = tqdm(img_files, desc="Infer", ncols=100)
+    torch.backends.cudnn.benchmark = True  # ★ 加速卷積
+    # 可選：限制 CPU 執行緒，避免和其他程式打架
+    # torch.set_num_threads(1)
 
-    for fp in tqdm(img_files, desc="Infer", ncols=100):
+    for fp in pbar:
         fname = os.path.basename(fp)
         fid_str = os.path.splitext(fname)[0]
         try:
             fid = int(fid_str)
         except ValueError:
-            # 非數字命名：Kaggle 通常需要數字 Image_ID，這裡略過避免壞掉
             continue
 
-        img_resized, (orig_w, orig_h), scale = load_image(fp, max_side=max_side)
-        x = tfm(img_resized).to(device).unsqueeze(0)
+        img, (orig_w, orig_h) = load_image(fp)
+        x = tfm(img).to(device).unsqueeze(0)
 
-        out = model(x)[0]
-        boxes = out["boxes"].detach().cpu().numpy()
+        t0 = time.perf_counter()
+        # ★ AMP 自動混合精度（GPU 上會更快）
+        with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
+            out = model(x)[0]
+        torch.cuda.synchronize() if device.type == "cuda" else None
+        pbar.set_postfix(sec=f"{(time.perf_counter()-t0):.3f}")
+
+        boxes  = out["boxes"].detach().cpu().numpy()
         scores = out["scores"].detach().cpu().numpy()
 
-        # 還原到原圖座標
-        if scale < 1.0:
-            inv = 1.0 / scale
-            boxes[:, [0, 2]] *= inv
-            boxes[:, [1, 3]] *= inv
-
-        # 分數過濾
+        # 過濾 + 按分數排序 + 取前 MAX_DETS
         keep = scores >= score_thr
-        boxes = boxes[keep]
-        scores = scores[keep]
+        boxes, scores = boxes[keep], scores[keep]
+        order = scores.argsort()[::-1]
+        if MAX_DETS is not None:
+            order = order[:MAX_DETS]
+        boxes, scores = boxes[order], scores[order]
 
-        # x1y1x2y2 → xywh 並裁邊
-        boxes[:, 0::2] = np.clip(boxes[:, 0::2], 0, orig_w - 1)
-        boxes[:, 1::2] = np.clip(boxes[:, 1::2], 0, orig_h - 1)
+        # xyxy -> xywh + 裁邊
+        boxes[:, [0,2]] = boxes[:, [0,2]].clip(0, orig_w - 1)
+        boxes[:, [1,3]] = boxes[:, [1,3]].clip(0, orig_h - 1)
         xywh = boxes.copy()
-        xywh[:, 2] = np.maximum(0.0, boxes[:, 2] - boxes[:, 0])
-        xywh[:, 3] = np.maximum(0.0, boxes[:, 3] - boxes[:, 1])
+        xywh[:, 2] = (boxes[:, 2] - boxes[:, 0]).clip(min=0.0)
+        xywh[:, 3] = (boxes[:, 3] - boxes[:, 1]).clip(min=0.0)
 
         parts = []
         for b, s in zip(xywh, scores):
-            if b[2] <= 0 or b[3] <= 0:
+            w = float(b[2]); h = float(b[3])
+            if w <= 0.0 or h <= 0.0:
                 continue
             parts.extend([
                 f"{float(s):.6f}",
                 f"{float(b[0]):.2f}",
                 f"{float(b[1]):.2f}",
-                f"{float(b[2]):.2f}",
-                f"{float(b[3]):.2f}",
-                "0"  # 單一類別 id
+                f"{w:.2f}",
+                f"{h:.2f}",
+                "0"
             ])
         pred_str = " ".join(parts)
         rows.append((fid, pred_str))
@@ -138,34 +128,23 @@ def run_infer_to_strings(model, img_dir, max_side=800, score_thr=0.10, device=No
     rows.sort(key=lambda x: x[0])
     return rows
 
-
 def write_submission(rows, out_csv):
     d = os.path.dirname(out_csv)
-    if d:
-        os.makedirs(d, exist_ok=True)
+    if d: os.makedirs(d, exist_ok=True)
     with open(out_csv, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["Image_ID", "PredictionString"])
-        for fid, pred in rows:
-            w.writerow([fid, pred])
-
+        w.writerows(rows)
 
 def main():
-    # 基本檢查
     assert os.path.isdir(IMG_DIR), f"找不到影像資料夾：{IMG_DIR}"
     assert os.path.isfile(CKPT_PATH), f"找不到權重：{CKPT_PATH}"
+    print(f"[Config] device={DEVICE}  ckpt={CKPT_PATH}  img_dir={IMG_DIR}  out={OUT_CSV}  thr={SCORE_THR}  max_side={MAX_SIDE}")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.backends.cudnn.benchmark = True
-
-    print(f"[Config] ckpt={CKPT_PATH}  img_dir={IMG_DIR}  out={OUT_CSV}  "
-          f"max_side={MAX_SIDE}  thr={SCORE_THR}")
-
-    model = load_model(CKPT_PATH, device)
-    rows = run_infer_to_strings(model, IMG_DIR, max_side=MAX_SIDE, score_thr=SCORE_THR, device=device)
+    model = load_model(CKPT_PATH, DEVICE)
+    rows = run_infer_to_strings(model, IMG_DIR, score_thr=SCORE_THR, device=DEVICE)
     write_submission(rows, OUT_CSV)
     print(f"[Done] Wrote submission to: {OUT_CSV}")
-
 
 if __name__ == "__main__":
     main()
