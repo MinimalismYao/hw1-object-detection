@@ -205,27 +205,56 @@ def dump_cocoeval(coco_eval: COCOeval, out_txt: str, out_json: str):
         f.write("- recall    的維度為 [IoU x category x area x maxDets]（每個 IoU 的最大可達召回）。\n")
         f.write("- 詳細陣列請見 eval_details.json（可用來畫曲線）。\n")
 
-    # 2) 完整 precision / recall 陣列 + 參數軸（JSON）
-    def _to_py(v):
-        """把 numpy / tensor / 其他可迭代物 轉成原生 Python 結構"""
-        if v is None:
-            return None
-        # numpy / torch 都優先嘗試 tolist
-        if hasattr(v, "tolist"):
+    # 2) 遞迴轉換為原生 Python 型別，方便 JSON 序列化
+    def _to_py(obj):
+        """把 numpy/tensor/容器遞迴轉成原生 Python（list/float/int/None 等）。"""
+        if obj is None or isinstance(obj, (str, int, float, bool)):
+            return obj
+
+        # numpy
+        try:
+            import numpy as _np
+            if isinstance(obj, _np.generic):
+                return obj.item()
+            if isinstance(obj, _np.ndarray):
+                return obj.tolist()
+        except Exception:
+            pass
+
+        # torch
+        try:
+            import torch as _torch
+            if isinstance(obj, _torch.Tensor):
+                return obj.detach().cpu().tolist()
+        except Exception:
+            pass
+
+        # 容器
+        if isinstance(obj, (list, tuple, set)):
+            return [_to_py(x) for x in obj]
+        if isinstance(obj, dict):
+            return {k: _to_py(v) for k, v in obj.items()}
+
+        # 其他支援 tolist 的
+        if hasattr(obj, "tolist"):
             try:
-                return v.tolist()
+                return obj.tolist()
             except Exception:
                 pass
-        # list/tuple/set 直接展平成 list
-        if isinstance(v, (list, tuple, set)):
-            return list(v)
-        # 其他標量
-        return v
+
+        # fallback
+        try:
+            return float(obj)
+        except Exception:
+            try:
+                return int(obj)
+            except Exception:
+                return str(obj)
 
     details = {
-        "precision": _to_py(coco_eval.eval.get("precision")),  # shape: [T,R,K,A,M]
-        "recall":    _to_py(coco_eval.eval.get("recall")),     # shape: [T,K,A,M]
-        "scores":    _to_py(coco_eval.eval.get("scores")),     # shape: [T,R,K,A,M]
+        "precision": _to_py(coco_eval.eval.get("precision")),  # [T,R,K,A,M]
+        "recall":    _to_py(coco_eval.eval.get("recall")),     # [T,K,A,M]
+        "scores":    _to_py(coco_eval.eval.get("scores")),     # [T,R,K,A,M]
         "params": {
             "iouThrs":    _to_py(coco_eval.params.iouThrs),    # len T
             "recThrs":    _to_py(coco_eval.params.recThrs),    # len R
@@ -234,11 +263,13 @@ def dump_cocoeval(coco_eval: COCOeval, out_txt: str, out_json: str):
             "maxDets":    _to_py(coco_eval.params.maxDets),    # [1,10,100]
         },
     }
+
     os.makedirs(os.path.dirname(out_json), exist_ok=True)
     with open(out_json, "w") as f:
         json.dump(details, f, indent=2)
 
     print(f"[Done] Results saved to:\n  - {out_txt}\n  - {out_json}")
+
 
 
 # ---------- 主流程 ----------
