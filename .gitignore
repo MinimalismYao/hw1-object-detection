@@ -16,6 +16,7 @@ venv/
 # ---- Dataset (Kaggle 下載)，檔案太大，請助教自行下載即可 ----
 data/train/
 data/test/
+data/mini_test/
 data/*.zip
 data/val
 
