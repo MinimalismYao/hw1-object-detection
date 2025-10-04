@@ -3,6 +3,20 @@ import torch
 import torchvision.transforms as T
 import numpy as np
 from PIL import Image
+import torch
+
+def _clip_and_filter_boxes(boxes: torch.Tensor, w: int, h: int, min_size: float = 1.0):
+    # 裁邊到影像內
+    boxes[:, 0::2] = boxes[:, 0::2].clamp(0, w - 1)
+    boxes[:, 1::2] = boxes[:, 1::2].clamp(0, h - 1)
+    # 保證 x1<x2, y1<y2
+    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+    ws = x2 - x1
+    hs = y2 - y1
+    keep = (ws >= min_size) & (hs >= min_size)
+    return boxes[keep], keep
+
+
 
 def _hflip_boxes(boxes, width: int):
     # boxes: Tensor [N,4] in (x1,y1,x2,y2), width: image width
