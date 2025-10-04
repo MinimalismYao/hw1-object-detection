@@ -4,8 +4,13 @@ from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
 from torchvision.models.detection.rpn import AnchorGenerator
 
 def get_fasterrcnn_r50_fpn(num_classes=2, freeze_backbone=True):
-    backbone = resnet_fpn_backbone(backbone_name='resnet50', weights=None,
-                                   trainable_layers=0 if freeze_backbone else 5)
+    backbone = resnet_fpn_backbone(
+    backbone_name='resnet50',
+    weights=None,             # 檢測端不載入
+    # 某些版本有這個參數，顯式寫出更保險
+    weights_backbone=None,    # backbone 端也不載入
+    trainable_layers=0 if freeze_backbone else 5
+    )
 
     # 5 個 feature maps → 必須給 5 組 sizes / aspect_ratios
     anchor_sizes   = ((32,), (64,), (128,), (256,), (512,))
