@@ -2,213 +2,177 @@
 # -*- coding: utf-8 -*-
 """
 eval.py
-在 validation set 計算 mAP@50 與 mAP@50:95（使用 pycocotools）。
-預設資料結構：
-  data/val/
-    ├─ img/               # 驗證影像（檔名如 00000001.jpg）
-    └─ gt_val.txt         # 內容: frame, l, t, w, h  （與 train 的 gt.txt 同格式）
+對驗證集 (val) 進行推論並計算 mAP@50 與 mAP@50:95
+使用 pycocotools COCO API。
 
-模型：
-  experiments/logs/fasterrcnn_r50fpn_e5.pth  （可改）
+需求：
+- pycocotools
+- torchvision
+- dataset.py / model.py / transforms.py (專案已有)
 
-使用方式（有預設）：
-  python src/eval.py
-或客製：
-  python src/eval.py --img-dir data/val/img --gt data/val/gt_val.txt \
-                     --checkpoint experiments/logs/fasterrcnn_r50fpn_e5.pth \
-                     --max-side 800 --score-thr 0.05
+輸出：
+- 結果印在螢幕
+- 存到 experiments/eval_results.txt
 """
-import os, json, argparse, glob
-import torch
-import torchvision
+
+import os, glob, torch, json
 import numpy as np
-from PIL import Image
+from tqdm import tqdm
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
+from PIL import Image
 
+import torchvision
+from dataset import PigsDataset, collate_fn
+from transforms import get_transforms
 from model import get_fasterrcnn_r50_fpn
 
-def read_gt_txt(gt_path):
-    """
-    讀 <frame,l,t,w,h> 轉成 dict: {fid_str: [[l,t,w,h], ...]}
-    """
-    boxes_by_id = {}
-    with open(gt_path, "r", newline="") as f:
+
+
+
+# -----------------------------
+# 載入模型
+# -----------------------------
+def load_model(ckpt_path, device):
+    model = get_fasterrcnn_r50_fpn(num_classes=2, freeze_backbone=True).to(device)
+    state = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(state)
+    model.eval()
+    return model
+
+
+# -----------------------------
+# 建立 COCO GT dict
+# -----------------------------
+def build_coco_from_gt(gt_txt, img_dir):
+    images, annotations = [], []
+    ann_id, seen = 1, set()
+
+    with open(gt_txt, "r") as f:
         for line in f:
             if not line.strip():
                 continue
-            v = [x.strip() for x in line.split(",")]
-            if len(v) != 5:
-                continue
-            frame, l, t, w, h = v
-            fid = f"{int(float(frame)):08d}"
-            l, t, w, h = map(int, (l, t, w, h))
-            if w <= 0 or h <= 0:
-                continue
-            boxes_by_id.setdefault(fid, []).append([l, t, w, h])
-    return boxes_by_id
+            frame, l, t, w, h = [x.strip() for x in line.split(",")]
+            img_id = int(float(frame))
+            file_name = f"{img_id:08d}.jpg"
 
-def build_coco_gt(img_dir, gt_path, out_json_path=None):
-    """
-    把 val 的標註轉成 COCO JSON 給 pycocotools 用。
-    單一類別：pig，category_id=1
-    """
-    boxes_by_id = read_gt_txt(gt_path)
-    # 收集 val 圖片 id（依檔案存在）
-    img_files = sorted(glob.glob(os.path.join(img_dir, "*.jpg")))
-    images = []
-    annotations = []
-    ann_id = 1
-    for fp in img_files:
-        fname = os.path.basename(fp)
-        fid = os.path.splitext(fname)[0]  # 00000001
-        try:
-            im = Image.open(fp).convert("RGB")
-            w, h = im.size
-        except Exception:
-            continue
-        images.append({
-            "id": int(fid),
-            "file_name": fname,
-            "width": w,
-            "height": h
-        })
-        for l, t, bw, bh in boxes_by_id.get(fid, []):
+            if img_id not in seen:
+                with Image.open(os.path.join(img_dir, file_name)) as im:
+                    W, H = im.size
+                images.append({"id": img_id, "file_name": file_name,
+                               "width": W, "height": H})
+                seen.add(img_id)
+
+            bbox = [int(l), int(t), int(w), int(h)]
             annotations.append({
                 "id": ann_id,
-                "image_id": int(fid),
+                "image_id": img_id,
                 "category_id": 1,
-                "bbox": [float(l), float(t), float(bw), float(bh)],
-                "area": float(bw * bh),
-                "iscrowd": 0
+                "bbox": bbox,
+                "area": int(w) * int(h),
+                "iscrowd": 0,
             })
             ann_id += 1
 
-    coco = {
+    coco_dict = {
+        "info": {"description": "TAICA HW1 val"},
+        "licenses": [],
         "images": images,
         "annotations": annotations,
-        "categories": [{"id": 1, "name": "pig"}]
+        "categories": [{"id": 1, "name": "pig"}],
     }
-    if out_json_path:
-        os.makedirs(os.path.dirname(out_json_path), exist_ok=True)
-        with open(out_json_path, "w") as f:
-            json.dump(coco, f)
-    return coco
 
-@torch.no_grad()
-def run_inference(model, img_dir, max_side=800, score_thr=0.05, device=None):
-    """
-    對 val 圖片跑推論，回傳 COCO dt list
-    COCO dt 欄位：image_id, category_id, bbox[x,y,w,h], score
-    """
-    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.eval()
+    coco_gt = COCO()
+    coco_gt.dataset = coco_dict
+    coco_gt.createIndex()
+    return coco_gt
 
+
+# -----------------------------
+# 推論並轉 COCO 格式
+# -----------------------------
+@torch.inference_mode()
+def infer_and_build_dt(model, img_dir, device, max_side=800, score_thr=0.05):
+    tfm = torch.nn.Sequential(torchvision.transforms.ToTensor())
     img_files = sorted(glob.glob(os.path.join(img_dir, "*.jpg")))
     results = []
-    tfm = torchvision.transforms.Compose([
-        torchvision.transforms.ToTensor()
-    ])
 
-    for fp in img_files:
+    for fp in tqdm(img_files, desc="Infer", ncols=100):
         fname = os.path.basename(fp)
         fid = int(os.path.splitext(fname)[0])
-        img = Image.open(fp).convert("RGB")
-        # 等比縮放：長邊不超過 max_side
-        w, h = img.size
-        scale = min(1.0, float(max_side) / max(w, h))
-        if scale < 1.0:
-            new_w, new_h = int(round(w * scale)), int(round(h * scale))
-            img_resized = img.resize((new_w, new_h), resample=Image.BILINEAR)
-        else:
-            img_resized = img
 
-        x = tfm(img_resized).to(device).unsqueeze(0)  # 1,C,H,W
+        img = Image.open(fp).convert("RGB")
+        W, H = img.size
+        scale = min(1.0, float(max_side) / max(W, H))
+        if scale < 1.0:
+            new_w, new_h = int(W * scale), int(H * scale)
+            img = img.resize((new_w, new_h), resample=Image.BILINEAR)
+
+        x = torchvision.transforms.ToTensor()(img).to(device).unsqueeze(0)
         out = model(x)[0]
+
         boxes = out["boxes"].detach().cpu().numpy()
         scores = out["scores"].detach().cpu().numpy()
 
-        # 把 boxes 從 resized 空間還原回原圖座標
         if scale < 1.0:
             inv = 1.0 / scale
             boxes[:, [0, 2]] *= inv
             boxes[:, [1, 3]] *= inv
 
-        # 過濾低分數
         keep = scores >= score_thr
-        boxes = boxes[keep]
-        scores = scores[keep]
+        boxes, scores = boxes[keep], scores[keep]
 
-        # x1y1x2y2 → xywh，並裁切到影像內
-        boxes[:, 0::2] = np.clip(boxes[:, 0::2], 0, w - 1)
-        boxes[:, 1::2] = np.clip(boxes[:, 1::2], 0, h - 1)
-        xywh = boxes.copy()
-        xywh[:, 2] = np.maximum(0.0, boxes[:, 2] - boxes[:, 0])
-        xywh[:, 3] = np.maximum(0.0, boxes[:, 3] - boxes[:, 1])
-
-        for b, s in zip(xywh, scores):
-            if b[2] <= 0 or b[3] <= 0:
+        for b, s in zip(boxes, scores):
+            x1, y1, x2, y2 = b
+            w, h = x2 - x1, y2 - y1
+            if w <= 0 or h <= 0:
                 continue
             results.append({
                 "image_id": fid,
-                "category_id": 1,         # 單一類別
-                "bbox": [float(b[0]), float(b[1]), float(b[2]), float(b[3])],
-                "score": float(s)
+                "category_id": 1,
+                "bbox": [float(x1), float(y1), float(w), float(h)],
+                "score": float(s),
             })
+
     return results
 
-def coco_eval_from_dicts(coco_gt_dict, coco_dt_list):
-    # 建 COCO api
-    coco_gt = COCO()
-    coco_gt.dataset = coco_gt_dict
-    coco_gt.createIndex()
 
+# -----------------------------
+# 主程式
+# -----------------------------
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ckpt = "experiments/logs/fasterrcnn_r50fpn_e5.pth"   # 👈 你可以改成想要的權重
+    img_dir = "data/val/img"
+    gt_txt = "data/val/gt_val.txt"
+
+    if not os.path.isfile(ckpt):
+        raise FileNotFoundError(ckpt)
+
+    model = load_model(ckpt, device)
+
+    # === 建 GT ===
+    coco_gt = build_coco_from_gt(gt_txt, img_dir)
+
+    # === 建 DT ===
+    coco_dt_list = infer_and_build_dt(model, img_dir, device)
     coco_dt = coco_gt.loadRes(coco_dt_list)
 
-    # mAP50:95
-    E = COCOeval(coco_gt, coco_dt, iouType='bbox')
-    E.evaluate(); E.accumulate(); E.summarize()
-    map_50_95 = E.stats[0]  # AP @[.5:.95]
+    # === Eval ===
+    coco_eval = COCOeval(coco_gt, coco_dt, iouType="bbox")
+    coco_eval.evaluate()
+    coco_eval.accumulate()
+    coco_eval.summarize()
 
-    # mAP50
-    E50 = COCOeval(coco_gt, coco_dt, iouType='bbox')
-    E50.params.iouThrs = np.array([0.5])
-    E50.evaluate(); E50.accumulate(); E50.summarize()
-    map_50 = E50.stats[0]
+    m50 = coco_eval.stats[1]   # mAP@50
+    m5095 = coco_eval.stats[0] # mAP@50:95
 
-    return map_50, map_50_95
+    out_path = "experiments/eval_results.txt"
+    with open(out_path, "w") as f:
+        f.write(f"mAP@50: {m50:.4f}\n")
+        f.write(f"mAP@50:95: {m5095:.4f}\n")
+    print(f"[Done] Results saved to {out_path}")
 
-def parse_args():
-    p = argparse.ArgumentParser("Eval mAP on validation set (pycocotools).")
-    p.add_argument("--img-dir", type=str, default="data/val/img")
-    p.add_argument("--gt", type=str, default="data/val/gt_val.txt")
-    p.add_argument("--checkpoint", type=str, default="experiments/logs/fasterrcnn_r50fpn_e5.pth")
-    p.add_argument("--max-side", type=int, default=800)
-    p.add_argument("--score-thr", type=float, default=0.05)
-    return p.parse_args()
-
-def main():
-    args = parse_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # 構建/載入模型
-    model = get_fasterrcnn_r50_fpn(num_classes=2, freeze_backbone=True).to(device)
-    if not os.path.isfile(args.checkpoint):
-        raise FileNotFoundError(args.checkpoint)
-    state = torch.load(args.checkpoint, map_location=device)
-    model.load_state_dict(state)
-
-    # 準備 COCO GT
-    coco_gt = build_coco_gt(args.img_dir, args.gt)
-
-    # 推論 → COCO dt
-    coco_dt = run_inference(model, args.img_dir, max_side=args.max_side,
-                            score_thr=args.score_thr, device=device)
-
-    # 評估
-    m50, m5095 = coco_eval_from_dicts(coco_gt, coco_dt)
-    print(f"\n[Eval] mAP@50 = {m50:.4f}")
-    print(f"[Eval] mAP@50:95 = {m5095:.4f}")
 
 if __name__ == "__main__":
     main()
