@@ -23,19 +23,29 @@ class PigsDataset(Dataset):
 
     def _read_gt(self, gt_path):
         boxes = {}
+        bad = 0
         with open(gt_path, "r", newline="") as f:
             for line in f:
-                if not line.strip(): 
+                if not line.strip():
                     continue
                 v = [x.strip() for x in line.split(",")]
-                if len(v) != 5: 
+                if len(v) != 5:
                     continue
                 frame, l, t, w, h = v
                 fid = f"{int(float(frame)):08d}"
                 l, t, w, h = map(int, (l, t, w, h))
+
+                # ① 先過濾原始就不合法的框（寬或高 ≤ 0）
+                if w <= 0 or h <= 0:
+                    bad += 1
+                    continue
+
                 x1, y1, x2, y2 = l, t, l + w, t + h
                 boxes.setdefault(fid, []).append([x1, y1, x2, y2])
+        if bad:
+            print(f"[Dataset] Skipped {bad} invalid boxes from gt (w<=0 or h<=0).")
         return boxes
+
 
     def __len__(self):
         return len(self.ids)
