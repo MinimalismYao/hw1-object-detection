@@ -7,20 +7,39 @@ from model import get_fasterrcnn_r50_fpn
 
 def train_one_epoch(model, loader, optimizer, device):
     model.train()
-    total = 0.0
+    total_loss, nb = 0.0, 0
+
     for images, targets in loader:
         images = [img.to(device) for img in images]
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-        loss_dict = model(images, targets)        # dict: loss_classifier, loss_box_reg, loss_objectness, loss_rpn_box_reg
-        loss = sum(loss_dict.values())
+        loss_dict = model(images, targets)  # dict
+        # 檢查每個 loss 是否為有限值
+        for k, v in loss_dict.items():
+            if not torch.isfinite(v):
+                # 找出 image_id 方便追查
+                ids = [int(t["image_id"].item()) for t in targets if "image_id" in t]
+                print(f"[Warn] {k} is {v.item()} on images {ids}. Skip this batch.")
+                break
+        else:
+            loss = sum(loss_dict.values())
+            if not torch.isfinite(loss):
+                ids = [int(t["image_id"].item()) for t in targets if "image_id" in t]
+                print(f"[Warn] total loss is NaN/Inf on images {ids}. Skip.")
+                continue
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(  # 輕微防爆
+                [p for p in model.parameters() if p.requires_grad], max_norm=10.0
+            )
+            optimizer.step()
 
-        total += loss.item()
-    return total / max(1, len(loader))
+            total_loss += loss.item()
+            nb += 1
+
+    return total_loss / max(1, nb)
+
 
 def quick_sanity_check(model, device):
     # 用 batch_size=1 快速測試 forward/backward 是否正常
