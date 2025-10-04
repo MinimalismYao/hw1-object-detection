@@ -126,9 +126,9 @@ def parse_args():
 
 def main():
     # 內建預設（可改）
-    DEFAULT_CKPT = "experiments/logs/fasterrcnn_r50fpn_e5.pth"
+    DEFAULT_CKPT = "experiments/logs/fasterrcnn_r50fpn_final_v1.pth"
     DEFAULT_IMG  = "data/test/img"
-    DEFAULT_OUT  = "submission.csv"
+    DEFAULT_OUT  = "submission_v1.csv"
     DEFAULT_MAX  = 800
     DEFAULT_THR  = 0.10
 
