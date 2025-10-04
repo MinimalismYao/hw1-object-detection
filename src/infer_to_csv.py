@@ -20,21 +20,25 @@ from model import get_fasterrcnn_r50_fpn
 
 def load_model(ckpt_path, device):
     model = get_fasterrcnn_r50_fpn(num_classes=2, freeze_backbone=True).to(device)
-    # 安全載入（你存的是 state_dict，這樣沒問題）
+
+    # 載入權重（你存的是 state_dict，安全）
     state = torch.load(ckpt_path, map_location=device, weights_only=True)
     model.load_state_dict(state)
     model.eval()
 
-    # ====== 推論期加速調整（可依需要再調）======
-    # 減少 RPN 候選框數量（testing）
-    if hasattr(model, "rpn"):
-        # 這兩個是 dict: {'training': int, 'testing': int}
-        model.rpn.pre_nms_top_n['testing']  = min(3000, model.rpn.pre_nms_top_n['testing'])
-        model.rpn.post_nms_top_n['testing'] = min(1000, model.rpn.post_nms_top_n['testing'])
-        # NMS 門檻略高一些可減重疊（不一定要）
-        model.rpn.nms_thresh = getattr(model.rpn, "nms_thresh", 0.7)
+    # ---- 可選加速：僅在屬性是 dict 時才調整；否則略過，避免不同版本 torchvision 出錯 ----
+    try:
+        pre_nms = getattr(model.rpn, "pre_nms_top_n", None)
+        post_nms = getattr(model.rpn, "post_nms_top_n", None)
+        if isinstance(pre_nms, dict) and isinstance(post_nms, dict):
+            pre_nms["testing"] = min(3000, pre_nms.get("testing", 1000))
+            post_nms["testing"] = min(1000, post_nms.get("testing", 300))
+    except Exception:
+        # 不同版本結構差異，安全忽略
+        pass
 
     return model
+
 
 def load_image(fp, max_side=800):
     img = Image.open(fp).convert("RGB")
@@ -136,3 +140,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
