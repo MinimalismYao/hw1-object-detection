@@ -9,7 +9,7 @@ Faster R-CNN + ResNet50-FPN 訓練腳本（v4）
 """
 
 # ========= 可在這裡快速調整的區域 =========
-CFG_PATH = "experiments/configs/v4.yaml"  # 指定要讀的 YAML
+CFG_PATH = "experiments/configs/v5.yaml"  # 指定要讀的 YAML
 OVERRIDES = [
     # 例："train.epochs=40", "optimizer.lr=0.0025"
 ]
@@ -28,7 +28,7 @@ from tqdm import tqdm
 
 from dataset import PigsDataset, collate_fn
 from transforms import get_transforms
-from model import get_fasterrcnn_r50_fpn
+from src.modelv4 import get_fasterrcnn_r50_fpn
 from config import load_cfg  # 你專案內的 loader（支援 ${...} 與 overrides）
 
 

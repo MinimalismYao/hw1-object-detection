@@ -16,7 +16,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from config import load_cfg
-from model import get_fasterrcnn_r50_fpn
+from src.modelv4 import get_fasterrcnn_r50_fpn
 
 # ========= 可在這裡快速覆寫設定（可留空） =========
 CFG_PATH = "experiments/configs/v4.yaml"

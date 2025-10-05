@@ -1,0 +1,104 @@
+# ===== 頂層必要鍵（供現版 train.py 使用） =====
+seed: 42                     # train.py 會優先讀這個
+
+project:
+  name: hw1_od
+  seed: 42                   # 保留給其他腳本
+  run_name: fasterrcnn_v4.9
+  output_root: experiments/logs
+  output_dir: ${project.output_root}/${project.run_name}
+
+data:
+  root: data
+  train_img_dir: data/train/img
+  train_gt: data/train/gt.txt
+  val_img_dir: data/val/img
+  val_gt: data/val/gt_val.txt
+  test_img_dir: data/test/img
+  num_workers: 16
+
+model:
+  detector: fasterrcnn_r50_fpn
+  backbone: resnet50
+  num_classes: 2               
+  freeze_backbone: false
+  pretrained: false
+
+augment:
+  max_side: 1024
+  resize: null
+  flip_p: 0.5
+  hsv: false
+  mosaic: false
+
+train:
+  epochs: 50
+  batch_size: 4
+  grad_clip: 10.0
+  amp: true
+  cudnn_benchmark: true
+  accumulate: 1               # 可累積梯度（預設 1 即不累積）
+
+optimizer:
+  type: sgd
+  lr: 0.00085
+  weight_decay: 1.0e-4
+  momentum: 0.9
+
+scheduler:
+  type: cosine
+  step_size: 5
+  gamma: 0.1
+
+dataloader:
+  pin_memory: true
+  persistent_workers: false
+  prefetch_factor: 4
+  shuffle: true
+
+sanity_check:
+  enabled: true
+  batch_size: 1
+  max_side: 640
+
+checkpoint:
+  dir: ${project.output_dir}
+  name: ${project.run_name}.pth
+  save_last_only: true
+  save_full_path: ${checkpoint.dir}/${checkpoint.name}
+
+logging:
+  csv_name: train_log.csv
+  csv_path: ${project.output_dir}/${logging.csv_name}
+  print_interval: 10
+
+eval:
+  ckpt_path: experiments/logs/fasterrcnn_r50fpn_final_v2.pth
+  iou_thresholds: [0.50,0.55,0.60,0.65,0.70,0.75,0.80,0.85,0.90,0.95]
+  max_det: 100
+  save_dir: experiments/eval_results
+  result_txt: ${eval.save_dir}/${project.run_name}_results.txt
+  result_json: ${eval.save_dir}/${project.run_name}_details.json
+
+infer:
+  score_thr: 0.05
+  nms_iou: 0.5
+  submission_csv: submissions/${project.run_name}_submission.csv
+
+device:
+  cuda: true
+
+early_stop:
+  enabled: true
+  monitor: val_loss
+  mode: min
+  patience: 8
+  save_best: true
+  best_name: ${project.run_name}_best.pth
+
+rpn:
+  pre_nms_topk_train: 2000
+  post_nms_topk_train: 1000
+  pre_nms_topk_test: 4000
+  post_nms_topk_test: 2000
+  nms_thr: 0.7

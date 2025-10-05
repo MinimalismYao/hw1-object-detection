@@ -35,7 +35,7 @@ from tqdm import tqdm
 
 from dataset import PigsDataset, collate_fn
 from transforms import get_transforms
-from model import get_fasterrcnn_r50_fpn
+from src.modelv4 import get_fasterrcnn_r50_fpn
 from config import load_cfg  # 位於 src/config.py
 
 
