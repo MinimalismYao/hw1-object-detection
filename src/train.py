@@ -15,7 +15,7 @@ CFG_PATH = "experiments/configs/default.yaml"
 # 需要臨時覆寫的設定（採用 dot-notation），例：
 #   "train.epochs=40", "optimizer.lr=0.001", "model.freeze_backbone=true"
 OVERRIDES = [
-     "train.epochs=2",
+    # "train.epochs=2",
     # "optimizer.lr=0.003",
     # "augment.max_side=1024",
     # "checkpoint.name=fasterrcnn_r50fpn_final_v3.pth",

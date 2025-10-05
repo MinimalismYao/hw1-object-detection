@@ -29,7 +29,7 @@ augment:
 
 train:
   epochs: 30
-  batch_size: 4
+  batch_size: 8
   grad_clip: 10.0
   amp: false
   cudnn_benchmark: true
@@ -58,7 +58,7 @@ sanity_check:
 
 checkpoint:
   dir: ${project.output_dir}
-  name: ${project.run_name}.pth      # ← 模型輸出檔名
+  name: ${project.run_name}.pth     
   save_last_only: true
   save_full_path: ${checkpoint.dir}/${checkpoint.name}
 
