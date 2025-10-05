@@ -136,6 +136,8 @@ def train_one_epoch(model, loader, optimizer, device, epoch_idx, total_epochs,
 
         optimizer.zero_grad(set_to_none=True)
 
+        # ---- optimizer.step() 一定要先執行 ----
+        opt_stepped = False
         if amp and scaler is not None:
             scaler.scale(loss).backward()
             if grad_clip and grad_clip > 0:
@@ -143,14 +145,17 @@ def train_one_epoch(model, loader, optimizer, device, epoch_idx, total_epochs,
                 torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], grad_clip)
             scaler.step(optimizer)
             scaler.update()
+            opt_stepped = True
         else:
             loss.backward()
             if grad_clip and grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], grad_clip)
             optimizer.step()
+            opt_stepped = True
+        # --------------------------------------
 
-        # Step per-iteration scheduler（若有）
-        if scheduler_iter is not None:
+        # per-iteration scheduler（若有）：必須在 optimizer.step() 之後
+        if scheduler_iter is not None and opt_stepped:
             scheduler_iter.step()
 
         l_total = float(loss.item())
@@ -176,16 +181,14 @@ def train_one_epoch(model, loader, optimizer, device, epoch_idx, total_epochs,
         # 釋放暫存參考，避免 Python 容器 hold 住 tensor
         del loss_dict, loss, images, targets
 
-        # 避免長時間第一輪「卡住」的錯覺（其實在做大 batch 的第一個 forward/backward）
-        # 有 pbar + 平滑 loss 可以觀察是否在緩慢前進
-
     avg_loss = total_loss / max(1, num_batches)
     return avg_loss
 
 
 @torch.no_grad()
 def validate_one_epoch(model, loader, device, amp=False) -> float:
-    model.train()  # eval() 下不回 loss；採 train()+no_grad() 技巧
+    # eval() 下不回 loss；採 train()+no_grad() 技巧
+    model.train()
     total, n = 0.0, 0
     autocast_ctx = torch.amp.autocast("cuda") if amp else nullcontext()
     for images, targets in loader:
@@ -214,7 +217,7 @@ def main():
     torch.backends.cudnn.benchmark = cfg["train"]["cudnn_benchmark"]
     print(f"[Device] {device}")
 
-    # === 建模（用專案的 model.get_fasterrcnn_r50_fpn，與 train.py 一致） ===
+    # === 建模（與 train.py 一致） ===
     model = get_fasterrcnn_r50_fpn(
         num_classes=cfg["model"]["num_classes"],
         freeze_backbone=cfg["model"]["freeze_backbone"]
@@ -317,7 +320,7 @@ def main():
             scheduler_iter=scheduler_iter
         )
 
-        # epoch 級 scheduler
+        # epoch 級 scheduler：必須在該 epoch 已經做過 optimizer.step() 之後
         if scheduler_epoch is not None:
             scheduler_epoch.step()
 

@@ -19,7 +19,7 @@ from config import load_cfg
 from model import get_fasterrcnn_r50_fpn
 
 # ========= 可在這裡快速覆寫設定（可留空） =========
-CFG_PATH = "experiments/configs/default.yaml"
+CFG_PATH = "experiments/configs/v4.yaml"
 OVERRIDES = [
     #"checkpoint.save_full_path=experiments/logs/fasterrcnn_r50fpn_final_v2.pth",
     #"project.run_name=fasterrcnn_v2",  
