@@ -6,8 +6,8 @@ src/eval.py
 單類別（class=0=pig）COCO 風格指標（AP/AR）並以 COCO 官方摘要格式輸出。
 只讀 data/val/img 與 data/val/gt_val.txt。
 做法優化：
-- 收集階段就先對每張影像只保留 Top-100 分數的框（與 COCO maxDets 對齊）
-- 在每個主要階段印出進度（flush=True），避免看起來「沒反應」
+- 收集階段就先對每張影像只保留 Top-K（與 COCO maxDets 對齊）
+- 每個主要階段印出進度（flush=True）
 """
 
 from pathlib import Path
@@ -21,14 +21,16 @@ from tqdm import tqdm
 import numpy as np
 
 from config import load_cfg
-from modelv4 import get_fasterrcnn_r50_fpn   # ← 重點：不要有 src.，也不要 .py
+from modelv4 import get_fasterrcnn_r50_fpn  # 與 `python src/eval.py` 相容的匯入方式
 
-
+# ========= 可在這裡快速覆寫設定（可留空） =========
 CFG_PATH = "experiments/configs/v4.yaml"
 OVERRIDES = [
     "checkpoint.save_full_path=experiments/logs/fasterrcnn_v4.9/fasterrcnn_v4.9_best.pth",
-    "project.run_name=fasterrcnn_v4.9_best.pth",  
+    "project.run_name=fasterrcnn_v4_9_best",  # 只影響輸出檔名
 ]
+# =================================================
+
 
 def resize_keep_max_side(pil_img: Image.Image, max_side: int) -> Image.Image:
     w, h = pil_img.size
@@ -37,6 +39,7 @@ def resize_keep_max_side(pil_img: Image.Image, max_side: int) -> Image.Image:
     scale = float(max_side) / max(w, h)
     new_w, new_h = int(round(w * scale)), int(round(h * scale))
     return pil_img.resize((new_w, new_h), resample=Image.BILINEAR)
+
 
 def load_gt(gt_txt_path: Path):
     gt_map = defaultdict(list)
@@ -54,6 +57,7 @@ def load_gt(gt_txt_path: Path):
         gt_map[k] = torch.tensor(gt_map[k], dtype=torch.float32)
     return gt_map
 
+
 def list_val_images(img_dir: Path):
     exts = (".jpg", ".jpeg", ".png", ".bmp", ".JPG", ".JPEG", ".PNG", ".BMP")
     items = []
@@ -65,11 +69,13 @@ def list_val_images(img_dir: Path):
     items.sort(key=lambda t: t[0])
     return items
 
+
 def xywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
     out = boxes.clone()
     out[:, 2] = boxes[:, 0] + boxes[:, 2]
     out[:, 3] = boxes[:, 1] + boxes[:, 3]
     return out
+
 
 def compute_ap(rec, prec):
     mrec = np.concatenate(([0.0], rec, [1.0]))
@@ -78,6 +84,7 @@ def compute_ap(rec, prec):
         mpre[i - 1] = np.maximum(mpre[i - 1], mpre[i])
     idx = np.where(mrec[1:] != mrec[:-1])[0]
     return np.sum((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1])
+
 
 def eval_split(det_records, gt_map_xywh, image_ids, iou_thr, max_dets=None, area_rng=None):
     # 篩 det by image + top-k
@@ -100,7 +107,8 @@ def eval_split(det_records, gt_map_xywh, image_ids, iou_thr, max_dets=None, area
         for fid in image_ids:
             g = gt_map_xywh.get(fid, torch.zeros((0, 4)))
             if g.numel() == 0:
-                gt_sel[fid] = g; continue
+                gt_sel[fid] = g
+                continue
             areas = g[:, 2] * g[:, 3]
             keep = (areas >= amin) & (areas < amax)
             gt_sel[fid] = g[keep]
@@ -122,17 +130,13 @@ def eval_split(det_records, gt_map_xywh, image_ids, iou_thr, max_dets=None, area
         if g.shape[0] == 0:
             tp.append(0); fp.append(1); continue
         ious = torchvision.ops.box_iou(b, g)[0]
-        best_iou, best_idx = (ious.max().item(), int(ious.argmax().item())) if ious.numel() > 0 else (0.0, -1)
+        if ious.numel() == 0:
+            tp.append(0); fp.append(1); continue
+        best_idx = int(ious.argmax().item())
+        best_iou = float(ious[best_idx].item())
         if best_iou >= iou_thr and not gt_matched[fid][best_idx]:
             tp.append(1); fp.append(0); gt_matched[fid][best_idx] = True
-        else: ~/projects/hw1-object-detection  on main !3 ?1 ────────────────────────────────────────────────────────────────────────── env_cvpdl_hw1   at 22:13:39 
-❯ python src/eval.py
-Traceback (most recent call last):
-  File "/home/yao/projects/hw1-object-detection/src/eval.py", line 24, in <module>
-    from src.model import get_fasterrcnn_r50_fpn
-ModuleNotFoundError: No module named 'src'
-
-
+        else:
             tp.append(0); fp.append(1)
 
     tp = np.array(tp); fp = np.array(fp)
@@ -145,6 +149,7 @@ ModuleNotFoundError: No module named 'src'
         ap = compute_ap(rec, prec)
     ar = float(rec.max()) if rec.size > 0 else 0.0
     return ap, ar, int(num_gt_total)
+
 
 @torch.inference_mode()
 def main():
@@ -160,6 +165,8 @@ def main():
     iou_list = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
     max_side = int(cfg["augment"]["max_side"])
     score_thr = float(cfg["infer"]["score_thr"])
+    max_dets_cfg = int(cfg["eval"].get("max_det", 100))
+
     out_txt  = Path(cfg["eval"]["result_txt"])
     out_json = Path(cfg["eval"]["result_json"])
     out_txt.parent.mkdir(parents=True, exist_ok=True)
@@ -176,6 +183,7 @@ def main():
         num_classes=cfg["model"]["num_classes"],
         freeze_backbone=cfg["model"]["freeze_backbone"]
     ).to(device)
+
     # ✅ 優先使用 save_full_path；否則退回 dir/name
     ckpt_cfg  = cfg["checkpoint"]
     ckpt_path = Path(ckpt_cfg.get("save_full_path") or (Path(ckpt_cfg["dir"]) / ckpt_cfg["name"]))
@@ -198,7 +206,7 @@ def main():
     model.eval()
 
     print(f"[1/4] Inference on val images ...", flush=True)
-    # 收集偵測（每張圖預先限制 Top-100，加速後續評分）
+    # 收集偵測（每張圖預先限制 Top-K，加速後續評分）
     det_records = []
     to_tensor = torchvision.transforms.ToTensor()
     for fid, fp in tqdm(val_images, ncols=100, desc="Eval on val"):
@@ -213,9 +221,9 @@ def main():
         # 低分過濾
         keep = scores >= score_thr
         boxes = boxes[keep]; scores = scores[keep]
-        # 只留 Top-100
-        if scores.numel() > 100:
-            topk = min(100, scores.numel())
+        # 只留 Top-K（與 COCO maxDets 對齊）
+        if scores.numel() > max_dets_cfg:
+            topk = min(max_dets_cfg, scores.numel())
             vals, idxs = torch.topk(scores, k=topk)
             boxes = boxes[idxs]; scores = vals
         for b, s in zip(boxes.tolist(), scores.tolist()):
@@ -230,19 +238,19 @@ def main():
         "large":  (A_M, A_L),
     }
 
-    print(f"[2/4] Computing AP (IoU=0.50:0.95, area=all, maxDets=100) ...", flush=True)
+    print(f"[2/4] Computing AP (IoU=0.50:0.95, area=all, maxDets={max_dets_cfg}) ...", flush=True)
     aps = []
     for thr in iou_list:
-        ap, _, _ = eval_split(det_records, gt_map_xywh, image_ids, thr, max_dets=100, area_rng=area_ranges["all"])
+        ap, _, _ = eval_split(det_records, gt_map_xywh, image_ids, thr, max_dets=max_dets_cfg, area_rng=area_ranges["all"])
         aps.append(ap)
     ap_50_95 = float(np.mean(aps) if aps else 0.0)
 
     print(f"[3/4] Computing AP by IoU (0.50/0.75) and by area (S/M/L) ...", flush=True)
-    ap_50, _, _ = eval_split(det_records, gt_map_xywh, image_ids, 0.50, max_dets=100, area_rng=area_ranges["all"])
-    ap_75, _, _ = eval_split(det_records, gt_map_xywh, image_ids, 0.75, max_dets=100, area_rng=area_ranges["all"])
-    ap_small  = float(np.mean([eval_split(det_records, gt_map_xywh, image_ids, t, 100, area_ranges["small"])[0]  for t in iou_list]))
-    ap_medium = float(np.mean([eval_split(det_records, gt_map_xywh, image_ids, t, 100, area_ranges["medium"])[0] for t in iou_list]))
-    ap_large  = float(np.mean([eval_split(det_records, gt_map_xywh, image_ids, t, 100, area_ranges["large"])[0]  for t in iou_list]))
+    ap_50, _, _ = eval_split(det_records, gt_map_xywh, image_ids, 0.50, max_dets=max_dets_cfg, area_rng=area_ranges["all"])
+    ap_75, _, _ = eval_split(det_records, gt_map_xywh, image_ids, 0.75, max_dets=max_dets_cfg, area_rng=area_ranges["all"])
+    ap_small  = float(np.mean([eval_split(det_records, gt_map_xywh, image_ids, t, max_dets_cfg, area_ranges["small"])[0]  for t in iou_list]))
+    ap_medium = float(np.mean([eval_split(det_records, gt_map_xywh, image_ids, t, max_dets_cfg, area_ranges["medium"])[0] for t in iou_list]))
+    ap_large  = float(np.mean([eval_split(det_records, gt_map_xywh, image_ids, t, max_dets_cfg, area_ranges["large"])[0]  for t in iou_list]))
 
     print(f"[4/4] Computing AR (maxDets=1/10/100) ...", flush=True)
     def mean_ar(max_dets, area_key):
@@ -262,12 +270,12 @@ def main():
     # 輸出
     lines = []
     lines.append("===== COCO Evaluation Summary =====\n")
-    lines.append(f"AP @[ IoU=0.50:0.95 | area=all | maxDets=100 ]                         = {ap_50_95:.6f}")
-    lines.append(f"AP @[ IoU=0.50      | area=all | maxDets=100 ]                         = {ap_50:.6f}")
-    lines.append(f"AP @[ IoU=0.75      | area=all | maxDets=100 ]                         = {ap_75:.6f}")
-    lines.append(f"AP @[ IoU=0.50:0.95 | area=small | maxDets=100 ]                       = {ap_small:.6f}")
-    lines.append(f"AP @[ IoU=0.50:0.95 | area=medium | maxDets=100 ]                      = {ap_medium:.6f}")
-    lines.append(f"AP @[ IoU=0.50:0.95 | area=large | maxDets=100 ]                       = {ap_large:.6f}")
+    lines.append(f"AP @[ IoU=0.50:0.95 | area=all | maxDets={max_dets_cfg} ]              = {ap_50_95:.6f}")
+    lines.append(f"AP @[ IoU=0.50      | area=all | maxDets={max_dets_cfg} ]              = {ap_50:.6f}")
+    lines.append(f"AP @[ IoU=0.75      | area=all | maxDets={max_dets_cfg} ]              = {ap_75:.6f}")
+    lines.append(f"AP @[ IoU=0.50:0.95 | area=small | maxDets={max_dets_cfg} ]            = {ap_small:.6f}")
+    lines.append(f"AP @[ IoU=0.50:0.95 | area=medium | maxDets={max_dets_cfg} ]           = {ap_medium:.6f}")
+    lines.append(f"AP @[ IoU=0.50:0.95 | area=large | maxDets={max_dets_cfg} ]            = {ap_large:.6f}")
     lines.append(f"AR @[ IoU=0.50:0.95 | area=all | maxDets=1 ]                           = {ar_1_all:.6f}")
     lines.append(f"AR @[ IoU=0.50:0.95 | area=all | maxDets=10 ]                          = {ar_10_all:.6f}")
     lines.append(f"AR @[ IoU=0.50:0.95 | area=all | maxDets=100 ]                         = {ar_100_all:.6f}")
@@ -300,12 +308,14 @@ def main():
         "AR_100_medium": ar_100_m,
         "AR_100_large": ar_100_l,
         "iou_list": iou_list,
+        "max_dets_eval": max_dets_cfg,
     }
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(details, f, indent=2, ensure_ascii=False)
 
     # 同步印到 console
     print("\n".join(lines), flush=True)
+
 
 if __name__ == "__main__":
     main()
