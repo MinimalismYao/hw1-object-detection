@@ -4,7 +4,7 @@ seed: 42                     # train.py 會優先讀這個
 project:
   name: hw1_od
   seed: 42                   # 保留給其他腳本
-  run_name: fasterrcnn_v4
+  run_name: fasterrcnn_v4.9
   output_root: experiments/logs
   output_dir: ${project.output_root}/${project.run_name}
 
@@ -32,7 +32,7 @@ augment:
   mosaic: false
 
 train:
-  epochs: 30
+  epochs: 50
   batch_size: 4
   grad_clip: 10.0
   amp: true
@@ -41,7 +41,7 @@ train:
 
 optimizer:
   type: sgd
-  lr: 0.001
+  lr: 0.00085
   weight_decay: 1.0e-4
   momentum: 0.9
 

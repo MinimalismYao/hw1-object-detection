@@ -25,8 +25,8 @@ from model import get_fasterrcnn_r50_fpn
 
 CFG_PATH = "experiments/configs/v4.yaml"
 OVERRIDES = [
-    #"checkpoint.save_full_path=experiments/logs/fasterrcnn_r50fpn_final_v2.pth",
-    #"project.run_name=fasterrcnn_v2",  
+    #"checkpoint.save_full_path=experiments/logs/fasterrcnn_v4/fasterrcnn_v4_best.pth",
+    #"project.run_name=fasterrcnn_v4_best.pth",  
 ]
 
 def resize_keep_max_side(pil_img: Image.Image, max_side: int) -> Image.Image:
