@@ -22,6 +22,11 @@ data/val
 
 # ---- 訓練與驗證 log (tensorboard, checkpoint)，檔案通常很大 ----
 experiments/logs/
+experiments/eval_results/
+submissions/
+*.pth
+*.pt
+*.ckpt
 runs/
 checkpoints/
 vis_gt/

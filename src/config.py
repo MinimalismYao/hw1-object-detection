@@ -9,28 +9,57 @@ def _now_tag():
     return datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
 def _expand_vars(d: Dict[str, Any]) -> Dict[str, Any]:
-    """支援 ${now} 與 ${a.b} 這種引用。"""
-    import re
+    import re, copy
     pattern = re.compile(r"\$\{([^}]+)\}")
-    def resolve(expr: str, root: Dict[str, Any]) -> str:
-        if expr == "now": 
-            return _now_tag()
-        # 支援 ${data.root} 形式
-        cur = root
-        for k in expr.split("."):
-            cur = cur[k]
-        return str(cur)
 
-    def recur(x):
-        if isinstance(x, dict):
-            return {k: recur(v) for k, v in x.items()}
-        if isinstance(x, list):
-            return [recur(v) for v in x]
-        if isinstance(x, str):
-            def repl(m): return resolve(m.group(1), d)
-            return pattern.sub(repl, x)
-        return x
-    return recur(d)
+    def _get_by_path(root: Dict[str, Any], path: str):
+        cur = root
+        for k in path.split("."):
+            cur = cur[k]
+        return cur
+
+    def _expand_once(obj, root):
+        # 字典/列表遞迴
+        if isinstance(obj, dict):
+            return {k: _expand_once(v, root) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_expand_once(v, root) for v in obj]
+
+        # 字串：支援 ${now} 與 ${a.b}
+        if isinstance(obj, str):
+            # 若是單一引用，直接回傳原型別（非字串）
+            m = pattern.fullmatch(obj.strip())
+            if m:
+                key = m.group(1)
+                if key == "now":
+                    return _now_tag()
+                try:
+                    return _get_by_path(root, key)
+                except Exception:
+                    return obj  # 找不到就原樣保留
+
+            # 其他情況（夾雜文字）逐一替換為字串
+            def _repl(mm):
+                key = mm.group(1)
+                if key == "now":
+                    return str(_now_tag())
+                try:
+                    val = _get_by_path(root, key)
+                    return str(val)
+                except Exception:
+                    return mm.group(0)
+            return pattern.sub(_repl, obj)
+        return obj
+
+    # 多輪展開直到收斂（最多 5 輪避免無限循環）
+    cur = copy.deepcopy(d)
+    for _ in range(5):
+        nxt = _expand_once(cur, cur)
+        if nxt == cur:
+            break
+        cur = nxt
+    return cur
+
 
 def _deep_update(base: Dict[str, Any], override: Dict[str, Any] | None) -> Dict[str, Any]:
     if not override: 
