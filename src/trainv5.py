@@ -8,10 +8,7 @@ from torchvision.models.detection import FasterRCNN
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.rpn import AnchorGenerator
 from torchvision.ops import MultiScaleRoIAlign
-from torchvision.ops.feature_pyramid_network import LastLevelMaxPool
-from torchvision.models._utils import IntermediateLayerGetter
-from torchvision.models.detection.backbone_utils import BackboneWithFPN
-
+from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
 
 # -------------------------- utils --------------------------
 def _as_tuple_sizes(sizes_like):
@@ -24,17 +21,11 @@ def _as_tuple_sizes(sizes_like):
     """
     if sizes_like is None:
         return None
-
-    # C) 單一數值
-    if isinstance(sizes_like, (int, float)):
+    if isinstance(sizes_like, (int, float)):  # C
         return ((int(sizes_like),),)
-
-    # B) 扁平 list/tuple
-    if isinstance(sizes_like, (list, tuple)) and all(isinstance(x, (int, float)) for x in sizes_like):
+    if isinstance(sizes_like, (list, tuple)) and all(isinstance(x, (int, float)) for x in sizes_like):  # B
         return tuple((int(x),) for x in sizes_like)
-
-    # A) 巢狀 list/tuple 或混合
-    if isinstance(sizes_like, (list, tuple)):
+    if isinstance(sizes_like, (list, tuple)):  # A or mixed
         out = []
         for s in sizes_like:
             if isinstance(s, (list, tuple)):
@@ -44,12 +35,9 @@ def _as_tuple_sizes(sizes_like):
             else:
                 out.append((int(s),))
         return tuple(out)
-
     raise TypeError(f"Unsupported type for rpn_anchor_sizes: {type(sizes_like)}")
 
-
 def _maybe_get(d: Dict[str, Any], path: str, default=None):
-    """安全取得巢狀 dict 值：_maybe_get(cfg, 'model.rpn_nms_thresh', 0.7)"""
     cur = d
     for k in path.split("."):
         if not isinstance(cur, dict) or k not in cur:
@@ -57,66 +45,17 @@ def _maybe_get(d: Dict[str, Any], path: str, default=None):
         cur = cur[k]
     return cur
 
-
-# --------------------- backbone (ResNet50-FPN) ---------------------
-def _build_resnet50_fpn(
-    pretrained_backbone: bool = False,
-    norm_layer=nn.BatchNorm2d,
-) -> BackboneWithFPN:
-    """
-    建 ResNet50 + FPN：
-    - 預設 from scratch（pretrained_backbone=False）
-    - 使用可學習 BN（from scratch 收斂較穩）
-    - 輸出 256 維通道的 FPN，並加上 P6（LastLevelMaxPool）
-    """
-    # 1) ResNet50
-    if pretrained_backbone:
-        try:
-            weights = torchvision.models.ResNet50_Weights.DEFAULT
-        except AttributeError:
-            weights = "IMAGENET1K_V1"
-        resnet = torchvision.models.resnet50(weights=weights, norm_layer=norm_layer)
-    else:
-        resnet = torchvision.models.resnet50(weights=None, norm_layer=norm_layer)
-
-    # 2) 取出 C2~C5
-    return_layers = {"layer1": "0", "layer2": "1", "layer3": "2", "layer4": "3"}
-    in_channels_list = [256, 512, 1024, 2048]
-    body = IntermediateLayerGetter(resnet, return_layers=return_layers)
-
-    # 3) 包成 FPN（相容不同 torchvision 版本的建構子）
-    try:
-        # 新版/部分版本簽名（具名參數可能不接受 body=，所以先用位置參數）
-        backbone = BackboneWithFPN(
-            body,
-            return_layers,
-            in_channels_list,
-            out_channels=256,
-            extra_blocks=LastLevelMaxPool(),
-        )
-    except TypeError:
-        # 極舊版可能需要完全位置參數
-        backbone = BackboneWithFPN(
-            body,
-            return_layers,
-            in_channels_list,
-            256,
-            LastLevelMaxPool(),
-        )
-
-    return backbone  # .out_channels = 256
-
-
-# --------------------- model builder ---------------------
+# --------------------- builder ---------------------
 def get_fasterrcnn_r50_fpn(
     num_classes: int = 2,
     freeze_backbone: bool = False,
     *,
-    # 可直接由參數控制（若傳了 cfg，會以 cfg 為優先，參數為後備）
+    # Transform / inference 參數
     min_size: Optional[int] = None,
     max_size: Optional[int] = None,
     image_mean: Iterable[float] = (0.0, 0.0, 0.0),
     image_std: Iterable[float] = (1.0, 1.0, 1.0),
+    # Anchors / RPN / ROI
     rpn_anchor_sizes: Optional[Iterable] = None,
     rpn_anchor_ratios: Iterable[float] = (0.5, 1.0, 2.0),
     rpn_pre_nms_top_n_train: int = 2000,
@@ -128,20 +67,16 @@ def get_fasterrcnn_r50_fpn(
     box_nms_thresh: float = 0.5,
     box_detections_per_img: int = 100,
     pretrained_backbone: bool = False,
-    # 允許把完整 cfg 傳進來（優先使用）
     cfg: Optional[Dict[str, Any]] = None,
 ) -> FasterRCNN:
     """
     Faster R-CNN (ResNet50-FPN)
-    - 預設 from scratch；可切為 pretrained_backbone=True
-    - 支援從 cfg 或函式參數設定 Transform / RPN / ROI / anchors
+    - 使用 torchvision 官方 resnet_fpn_backbone（相容性最佳）
+    - 支援從 cfg 覆蓋所有關鍵參數
     """
-
     # ---- 1) 從 cfg 取值（若存在） ----
-    mcfg = _maybe_get(cfg or {}, "model", {}) if cfg else {}
     acfg = _maybe_get(cfg or {}, "augment", {}) if cfg else {}
-
-    # Transform 尺寸：若沒指定，嘗試沿用 augment.max_side；否則 fallback 1024
+    # Transform 尺寸：若沒指定，沿用 augment.max_side；否則 fallback 1024
     min_size = _maybe_get(cfg or {}, "model.min_size", min_size)
     max_size = _maybe_get(cfg or {}, "model.max_size", max_size)
     if min_size is None and acfg:
@@ -156,14 +91,13 @@ def get_fasterrcnn_r50_fpn(
     sizes_tuple = _as_tuple_sizes(rpn_anchor_sizes) if rpn_anchor_sizes is not None else ((32,), (64,), (128,), (256,), (512,))
     rpn_anchor_ratios = _maybe_get(cfg or {}, "model.rpn_anchor_ratios", list(rpn_anchor_ratios))
 
-    # RPN / ROI
+    # RPN / ROI / Inference
     rpn_pre_nms_top_n_train = int(_maybe_get(cfg or {}, "model.rpn_pre_nms_top_n_train", rpn_pre_nms_top_n_train))
     rpn_post_nms_top_n_train = int(_maybe_get(cfg or {}, "model.rpn_post_nms_top_n_train", rpn_post_nms_top_n_train))
     rpn_pre_nms_top_n_test  = int(_maybe_get(cfg or {}, "model.rpn_pre_nms_top_n_test",  rpn_pre_nms_top_n_test))
     rpn_post_nms_top_n_test = int(_maybe_get(cfg or {}, "model.rpn_post_nms_top_n_test", rpn_post_nms_top_n_test))
     rpn_nms_thresh = float(_maybe_get(cfg or {}, "model.rpn_nms_thresh", rpn_nms_thresh))
 
-    # Inference（外部 eval/infer 仍可再做閾值/NMS，這裡是 RCNN 內部的）
     box_score_thresh = float(_maybe_get(cfg or {}, "model.box_score_thresh", box_score_thresh))
     box_nms_thresh   = float(_maybe_get(cfg or {}, "model.box_nms_thresh",   box_nms_thresh))
     box_detections_per_img = int(_maybe_get(cfg or {}, "model.box_detections_per_img", box_detections_per_img))
@@ -171,30 +105,35 @@ def get_fasterrcnn_r50_fpn(
     pretrained_backbone = bool(_maybe_get(cfg or {}, "model.pretrained_backbone", pretrained_backbone))
     freeze_backbone     = bool(_maybe_get(cfg or {}, "model.freeze_backbone", freeze_backbone))
 
-    # ---- 2) Backbone + FPN ----
-    backbone = _build_resnet50_fpn(pretrained_backbone=pretrained_backbone, norm_layer=nn.BatchNorm2d)
+    # ---- 2) Backbone with FPN（官方工具，避免 __init__ 相容性問題）----
+    #   - weights=None：不載入預訓練（from scratch）
+    #   - norm_layer=BatchNorm2d：可學 BN
+    #   - trainable_layers=5：全開可訓練（若 freeze_backbone=True 再凍結）
+    backbone = resnet_fpn_backbone(
+        backbone_name="resnet50",
+        weights=None if not pretrained_backbone else torchvision.models.ResNet50_Weights.DEFAULT if hasattr(torchvision.models, "ResNet50_Weights") else "IMAGENET1K_V1",
+        trainable_layers=5,
+        norm_layer=nn.BatchNorm2d,
+    )
 
     # ---- 3) Anchors / RoIAlign ----
-    # sizes_tuple 例如：((8,), (16,), (32,), (64,), (128,))
     anchor_generator = AnchorGenerator(
         sizes=sizes_tuple,
         aspect_ratios=(tuple(float(r) for r in rpn_anchor_ratios),) * len(sizes_tuple),
     )
-
-    # ROI 常用設定：用 P2~P5；P6 交由 RPN 使用即可
     roi_pooler = MultiScaleRoIAlign(
-        featmap_names=["0", "1", "2", "3"],
+        featmap_names=["0", "1", "2", "3"],   # FPN P2~P5
         output_size=7,
         sampling_ratio=2,
     )
 
-    # ---- 4) FasterRCNN 主體（顯式指定 Transform 與 RPN/ROI 參數）----
+    # ---- 4) FasterRCNN 主體 ----
     model = FasterRCNN(
         backbone=backbone,
         num_classes=num_classes,  # 背景+1類 = 2
         rpn_anchor_generator=anchor_generator,
         box_roi_pool=roi_pooler,
-        # GeneralizedRCNNTransform（與你的前處理協同）
+        # GeneralizedRCNNTransform
         min_size=int(min_size),
         max_size=int(max_size),
         image_mean=list(image_mean),
