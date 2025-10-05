@@ -24,7 +24,10 @@ from config import load_cfg
 from model import get_fasterrcnn_r50_fpn
 
 CFG_PATH = "experiments/configs/default.yaml"
-OVERRIDES = []
+OVERRIDES = [
+    "checkpoint.save_full_path=experiments/logs/fasterrcnn_r50fpn_final_v2.pth",
+    "project.run_name=fasterrcnn_v2",  
+]
 
 def resize_keep_max_side(pil_img: Image.Image, max_side: int) -> Image.Image:
     w, h = pil_img.size
@@ -165,11 +168,24 @@ def main():
         num_classes=cfg["model"]["num_classes"],
         freeze_backbone=cfg["model"]["freeze_backbone"]
     ).to(device)
-    ckpt_path = Path(cfg["checkpoint"]["dir"]) / cfg["checkpoint"]["name"]
+    # ✅ 優先使用 save_full_path；否則退回 dir/name
+    ckpt_cfg  = cfg["checkpoint"]
+    ckpt_path = Path(ckpt_cfg.get("save_full_path") or (Path(ckpt_cfg["dir"]) / ckpt_cfg["name"]))
+    print(f"[Eval] Using checkpoint: {ckpt_path}")
+    assert ckpt_path.exists(), f"找不到權重檔：{ckpt_path}"
+
+    # 載入（相容舊版 torch，並自動把 fp16 權重轉回 fp32）
+    def _state_to_fp32(state):
+        for k, v in list(state.items()):
+            if isinstance(v, torch.Tensor) and v.is_floating_point() and v.dtype == torch.float16:
+                state[k] = v.float()
+        return state
+
     try:
         state = torch.load(str(ckpt_path), map_location=device, weights_only=True)
     except TypeError:
         state = torch.load(str(ckpt_path), map_location=device)
+    state = _state_to_fp32(state)
     model.load_state_dict(state)
     model.eval()
 

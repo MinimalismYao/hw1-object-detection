@@ -213,10 +213,18 @@ def main():
     total_time = time.perf_counter() - total_t0
 
     # === 保存（只存最後一個） ===
-    ckpt_path = os.path.join(cfg["checkpoint"]["dir"], cfg["checkpoint"]["name"])
-    torch.save(model.state_dict(), ckpt_path)
+    ckpt_cfg  = cfg["checkpoint"]
+    ckpt_path = ckpt_cfg.get("save_full_path") or os.path.join(ckpt_cfg["dir"], ckpt_cfg["name"])
+    os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+
+    state = model.state_dict()
+    if ckpt_cfg.get("save_fp16", False):
+        # 可選：半精度存檔，檔案大約減半
+        state = {k: v.half() for k, v in state.items()}
+
+    torch.save(state, ckpt_path)
     print(f"[Save Final] {ckpt_path}")
-    print(f"[Done] Total training time: {total_time/60:.1f} min")
+
 
 
 if __name__ == "__main__":

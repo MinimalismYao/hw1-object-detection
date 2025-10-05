@@ -8,11 +8,8 @@ Image_ID,PredictionString
 1,<conf_1> <x_1> <y_1> <w_1> <h_1> <class_1> <conf_2> <x_2> <y_2> <w_2> <h_2> <class_2> ...
 """
 
-import os
 from pathlib import Path
-import glob
 import pandas as pd
-
 import torch
 import torchvision
 from PIL import Image
@@ -21,35 +18,28 @@ from tqdm import tqdm
 from config import load_cfg
 from model import get_fasterrcnn_r50_fpn
 
-
 # ========= 可在這裡快速覆寫設定（可留空） =========
 CFG_PATH = "experiments/configs/default.yaml"
 OVERRIDES = [
-    # "infer.score_thr=0.05",
-    # "infer.nms_iou=0.5",
-    # "checkpoint.name=fasterrcnn_v3.pth",
-    # "infer.submission_csv=submissions/fasterrcnn_v3_submission.csv",
+    "checkpoint.save_full_path=experiments/logs/fasterrcnn_r50fpn_final_v2.pth",
+    "project.run_name=fasterrcnn_v2",  
 ]
 # =================================================
 
 
 def list_images(img_dir: str):
     """列出所有影像檔（依檔名排序，支援多格式）"""
-    img_dir = Path(img_dir)
-    exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp")
+    p = Path(img_dir)
     files = []
-    for ext in exts:
-        files.extend(img_dir.glob(ext))
+    for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp"):
+        files.extend(p.glob(ext))
     def _key(fp: Path):
-        try:
-            return int(fp.stem)
-        except ValueError:
-            return fp.stem
+        s = fp.stem.lstrip("0")
+        return int(s) if s.isdigit() else fp.stem
     return sorted(files, key=_key)
 
 
 def resize_keep_max_side(pil_img: Image.Image, max_side: int) -> Image.Image:
-    """等比縮放：讓最長邊 = max_side；若原圖已小於 max_side 就不放大"""
     w, h = pil_img.size
     if max(w, h) <= max_side:
         return pil_img
@@ -59,11 +49,18 @@ def resize_keep_max_side(pil_img: Image.Image, max_side: int) -> Image.Image:
 
 
 def xyxy_to_xywh(boxes: torch.Tensor) -> torch.Tensor:
-    """(x1,y1,x2,y2) -> (x,y,w,h)"""
     boxes = boxes.clone()
     boxes[:, 2] = boxes[:, 2] - boxes[:, 0]
     boxes[:, 3] = boxes[:, 3] - boxes[:, 1]
     return boxes
+
+
+def _state_to_fp32(state):
+    """若 .pth 是半精度（float16），自動轉回 float32 再載入。"""
+    for k, v in list(state.items()):
+        if isinstance(v, torch.Tensor) and v.is_floating_point() and v.dtype == torch.float16:
+            state[k] = v.float()
+    return state
 
 
 @torch.inference_mode()
@@ -72,12 +69,17 @@ def main():
     project_root = Path(__file__).resolve().parents[1]
     cfg = load_cfg(str(project_root / CFG_PATH), overrides=OVERRIDES)
 
-    ckpt_path = Path(cfg["checkpoint"]["dir"]) / cfg["checkpoint"]["name"]
-    img_dir = Path(cfg["data"]["test_img_dir"])
-    out_csv = Path(cfg["infer"]["submission_csv"])
-    assert ckpt_path.exists(), f"找不到權重檔：{ckpt_path}"
-    assert img_dir.exists(), f"找不到測試影像資料夾：{img_dir}"
+    # ✅ 取得 ckpt：優先 save_full_path，否則用 dir/name
+    ckpt_cfg = cfg["checkpoint"]
+    ckpt_path = Path(ckpt_cfg.get("save_full_path") or (Path(ckpt_cfg["dir"]) / ckpt_cfg["name"]))
+    img_dir   = Path(cfg["data"]["test_img_dir"])
+    out_csv   = Path(cfg["infer"]["submission_csv"])
 
+    assert ckpt_path.exists(), f"找不到權重檔：{ckpt_path}"
+    assert img_dir.exists(),   f"找不到測試影像資料夾：{img_dir}"
+    print(f"[Using checkpoint] {ckpt_path}")
+
+    # === 裝置 ===
     device = torch.device("cuda" if torch.cuda.is_available() and cfg["device"]["cuda"] else "cpu")
 
     # === 載入模型 ===
@@ -85,10 +87,12 @@ def main():
         num_classes=cfg["model"]["num_classes"],
         freeze_backbone=cfg["model"]["freeze_backbone"]
     ).to(device)
+
     try:
         state = torch.load(str(ckpt_path), map_location=device, weights_only=True)
     except TypeError:
         state = torch.load(str(ckpt_path), map_location=device)
+    state = _state_to_fp32(state)  # 若是 fp16 就轉回 fp32
     model.load_state_dict(state)
     model.eval()
 
@@ -109,7 +113,8 @@ def main():
     print(f"[Infer] Output CSV: {out_csv}")
 
     for fp in tqdm(img_files, ncols=100, desc="Infer"):
-        image_id = int(fp.stem)
+        stem = fp.stem.lstrip("0")
+        image_id = int(stem) if stem != "" else 0  # 00000002.jpg -> 2
         img = Image.open(fp).convert("RGB")
         img = resize_keep_max_side(img, max_side=max_side)
         x = to_tensor(img).to(device).unsqueeze(0)
@@ -133,7 +138,7 @@ def main():
             x1, y1, w, h = [round(float(v), 2) for v in b]
             conf = round(float(s), 4)
             cls = 0  # pigs 固定 class=0
-            # 按規範順序：<conf> <bb_left> <bb_top> <bb_width> <bb_height> <class>
+            # <conf> <x> <y> <w> <h> <class>
             parts.extend([conf, x1, y1, w, h, cls])
         pred_str = " ".join(map(str, parts))
         results.append([image_id, pred_str])
