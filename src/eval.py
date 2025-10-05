@@ -21,7 +21,8 @@ from tqdm import tqdm
 import numpy as np
 
 from config import load_cfg
-from src.modelv4.py import get_fasterrcnn_r50_fpn
+from modelv4 import get_fasterrcnn_r50_fpn   # ← 重點：不要有 src.，也不要 .py
+
 
 CFG_PATH = "experiments/configs/v4.yaml"
 OVERRIDES = [
