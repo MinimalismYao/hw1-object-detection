@@ -1,17 +1,17 @@
 ===== COCO Evaluation Summary =====
 
-AP @[ IoU=0.50:0.95 | area=all | maxDets=100 ]                         = 0.663253
-AP @[ IoU=0.50      | area=all | maxDets=100 ]                         = 0.953717
-AP @[ IoU=0.75      | area=all | maxDets=100 ]                         = 0.720032
-AP @[ IoU=0.50:0.95 | area=small | maxDets=100 ]                       = 0.023632
-AP @[ IoU=0.50:0.95 | area=medium | maxDets=100 ]                      = 0.526642
-AP @[ IoU=0.50:0.95 | area=large | maxDets=100 ]                       = 0.343258
-AR @[ IoU=0.50:0.95 | area=all | maxDets=1 ]                           = 0.030652
-AR @[ IoU=0.50:0.95 | area=all | maxDets=10 ]                          = 0.287849
-AR @[ IoU=0.50:0.95 | area=all | maxDets=100 ]                         = 0.704315
-AR @[ IoU=0.50:0.95 | area=small | maxDets=100 ]                       = 0.501437
-AR @[ IoU=0.50:0.95 | area=medium | maxDets=100 ]                      = 0.708532
-AR @[ IoU=0.50:0.95 | area=large | maxDets=100 ]                       = 0.816022
+AP @[ IoU=0.50:0.95 | area=all | maxDets=100 ]                         = 0.580708
+AP @[ IoU=0.50      | area=all | maxDets=100 ]                         = 0.925428
+AP @[ IoU=0.75      | area=all | maxDets=100 ]                         = 0.597490
+AP @[ IoU=0.50:0.95 | area=small | maxDets=100 ]                       = 0.017362
+AP @[ IoU=0.50:0.95 | area=medium | maxDets=100 ]                      = 0.483474
+AP @[ IoU=0.50:0.95 | area=large | maxDets=100 ]                       = 0.185700
+AR @[ IoU=0.50:0.95 | area=all | maxDets=1 ]                           = 0.030721
+AR @[ IoU=0.50:0.95 | area=all | maxDets=10 ]                          = 0.266293
+AR @[ IoU=0.50:0.95 | area=all | maxDets=100 ]                         = 0.640576
+AR @[ IoU=0.50:0.95 | area=small | maxDets=100 ]                       = 0.450924
+AR @[ IoU=0.50:0.95 | area=medium | maxDets=100 ]                      = 0.647633
+AR @[ IoU=0.50:0.95 | area=large | maxDets=100 ]                       = 0.724171
 
 
 [說明]
