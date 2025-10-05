@@ -21,12 +21,12 @@ from tqdm import tqdm
 import numpy as np
 
 from config import load_cfg
-from src.modelv4 import get_fasterrcnn_r50_fpn
+from src.modelv4.py import get_fasterrcnn_r50_fpn
 
 CFG_PATH = "experiments/configs/v4.yaml"
 OVERRIDES = [
-    #"checkpoint.save_full_path=experiments/logs/fasterrcnn_v4/fasterrcnn_v4_best.pth",
-    #"project.run_name=fasterrcnn_v4_best.pth",  
+    "checkpoint.save_full_path=experiments/logs/fasterrcnn_v4.9/fasterrcnn_v4.9_best.pth",
+    "project.run_name=fasterrcnn_v4.9_best.pth",  
 ]
 
 def resize_keep_max_side(pil_img: Image.Image, max_side: int) -> Image.Image:
@@ -124,7 +124,14 @@ def eval_split(det_records, gt_map_xywh, image_ids, iou_thr, max_dets=None, area
         best_iou, best_idx = (ious.max().item(), int(ious.argmax().item())) if ious.numel() > 0 else (0.0, -1)
         if best_iou >= iou_thr and not gt_matched[fid][best_idx]:
             tp.append(1); fp.append(0); gt_matched[fid][best_idx] = True
-        else:
+        else: ~/projects/hw1-object-detection  on main !3 ?1 ────────────────────────────────────────────────────────────────────────── env_cvpdl_hw1   at 22:13:39 
+❯ python src/eval.py
+Traceback (most recent call last):
+  File "/home/yao/projects/hw1-object-detection/src/eval.py", line 24, in <module>
+    from src.model import get_fasterrcnn_r50_fpn
+ModuleNotFoundError: No module named 'src'
+
+
             tp.append(0); fp.append(1)
 
     tp = np.array(tp); fp = np.array(fp)

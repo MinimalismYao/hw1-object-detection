@@ -1,10 +1,9 @@
-# ===== 頂層必要鍵（供現版 train.py 使用） =====
-seed: 42                     # train.py 會優先讀這個
+seed: 42
 
 project:
   name: hw1_od
-  seed: 42                   # 保留給其他腳本
-  run_name: fasterrcnn_v4.9
+  seed: 42
+  run_name: fasterrcnn_v5
   output_root: experiments/logs
   output_dir: ${project.output_root}/${project.run_name}
 
@@ -20,39 +19,50 @@ data:
 model:
   detector: fasterrcnn_r50_fpn
   backbone: resnet50
-  num_classes: 2               
+  num_classes: 2
   freeze_backbone: false
   pretrained: false
 
+  # === 方案 1A：小物體強化 ===
+  rpn_anchor_sizes: [[8], [16], [32], [64], [128]]
+  rpn_anchor_ratios: [0.5, 1.0, 2.0]
+
+  # 提高 RPN 提案數（訓練/測試）
+  rpn_pre_nms_top_n_train: 4000
+  rpn_post_nms_top_n_train: 2000
+  rpn_pre_nms_top_n_test:  3000
+  rpn_post_nms_top_n_test: 1000
+  rpn_nms_thresh: 0.7
+
 augment:
-  max_side: 1024
+  max_side: 1280
   resize: null
   flip_p: 0.5
   hsv: false
   mosaic: false
 
 train:
-  epochs: 50
+  epochs: 36
   batch_size: 4
   grad_clip: 10.0
   amp: true
   cudnn_benchmark: true
-  accumulate: 1               # 可累積梯度（預設 1 即不累積）
+  accumulate: 1
 
 optimizer:
   type: sgd
-  lr: 0.00085
+  lr: 0.003
   weight_decay: 1.0e-4
   momentum: 0.9
 
 scheduler:
-  type: cosine
+  type: steplr
   step_size: 5
   gamma: 0.1
 
 dataloader:
   pin_memory: true
-  persistent_workers: false
+  persistent_workers: true
   prefetch_factor: 4
   shuffle: true
 
@@ -66,6 +76,7 @@ checkpoint:
   name: ${project.run_name}.pth
   save_last_only: true
   save_full_path: ${checkpoint.dir}/${checkpoint.name}
+  # save_fp16: true   # 想讓 ckpt 檔案縮半，可打開
 
 logging:
   csv_name: train_log.csv
@@ -73,7 +84,6 @@ logging:
   print_interval: 10
 
 eval:
-  ckpt_path: experiments/logs/fasterrcnn_r50fpn_final_v2.pth
   iou_thresholds: [0.50,0.55,0.60,0.65,0.70,0.75,0.80,0.85,0.90,0.95]
   max_det: 100
   save_dir: experiments/eval_results
@@ -81,7 +91,7 @@ eval:
   result_json: ${eval.save_dir}/${project.run_name}_details.json
 
 infer:
-  score_thr: 0.05
+  score_thr: 0.03
   nms_iou: 0.5
   submission_csv: submissions/${project.run_name}_submission.csv
 
@@ -95,10 +105,3 @@ early_stop:
   patience: 8
   save_best: true
   best_name: ${project.run_name}_best.pth
-
-rpn:
-  pre_nms_topk_train: 2000
-  post_nms_topk_train: 1000
-  pre_nms_topk_test: 4000
-  post_nms_topk_test: 2000
-  nms_thr: 0.7
