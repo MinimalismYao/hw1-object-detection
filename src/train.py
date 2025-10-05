@@ -1,23 +1,34 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-train.py
-Faster R-CNN + ResNet50-FPN（backbone 可選凍結）訓練腳本。
-- 內建可調參數（檔頭區域）
-- tqdm 進度列 + per-batch 訊息（loss 分項、batch time、LR）
-- NaN/Inf 防護 + 斜率裁剪（gradient clipping）
-- 只保存最後一個權重檔
-- 開機前做一次 quick sanity check（batch_size=1）
-
-資料位置假設：
-  data/train/img    (影像)
-  data/train/gt.txt (標註：frame,x,y,w,h)
-
-
+src/train.py
+Faster R-CNN + ResNet50-FPN 訓練腳本（檔頭可調參數版）。
+- 在檔頭選擇 YAML、列出覆寫鍵值（不需要命令列參數）
+- 保留：tqdm、Sanity Check、StepLR、Gradient Clipping、只存最後權重
+- 預設讀取 experiments/configs/default.yaml
 """
+
+# ========= 可在這裡快速調整的區域（只改這塊就好） =========
+# 指定要讀的 YAML 設定檔（相對於專案根目錄）
+CFG_PATH = "experiments/configs/default.yaml"
+
+# 需要臨時覆寫的設定（採用 dot-notation），例：
+#   "train.epochs=40", "optimizer.lr=0.001", "model.freeze_backbone=true"
+OVERRIDES = [
+     "train.epochs=2",
+    # "optimizer.lr=0.003",
+    # "augment.max_side=1024",
+    # "checkpoint.name=fasterrcnn_r50fpn_final_v3.pth",
+]
+
+# 若你想強制跳過或啟用 sanity check，可在此覆寫（None = 依 YAML）
+SANITY_CHECK_FORCE = None  # 可選：True / False / None
+# =======================================================
+
 
 import os
 import time
+from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -25,27 +36,11 @@ from tqdm import tqdm
 from dataset import PigsDataset, collate_fn
 from transforms import get_transforms
 from model import get_fasterrcnn_r50_fpn
+from config import load_cfg  # 位於 src/config.py
 
 
-# ========= 可自行修改的設定 =========
-EPOCHS       = 30
-BATCH_SIZE   = 4
-MAX_SIDE     = 1024
-LR           = 0.003
-WEIGHT_DECAY = 1e-4
-STEP_SIZE    = 5
-GAMMA        = 0.1
-FREEZE_BB    = False   # 是否凍結 ResNet50 backbone
-NUM_WORKERS  = 8       # 使用幾顆 CPU 讀資料
-GRAD_CLIP    = 10.0    # 0 或 None 代表不裁剪
-
-CKPT_DIR     = "experiments/logs"
-CKPT_NAME    = "fasterrcnn_r50fpn_final_v3.pth"   # 只保存最後一個
-# ====================================
-
-
+# ---- 小工具：平滑顯示 ----
 class SmoothedValue:
-    """簡單的指數平滑，用於 tqdm 顯示"""
     def __init__(self, alpha=0.9):
         self.alpha = alpha
         self.avg = None
@@ -76,11 +71,10 @@ def train_one_epoch(model, loader, optimizer, device, epoch_idx, total_epochs, g
 
         loss_dict = model(images, targets)  # dict: loss_classifier, loss_box_reg, loss_objectness, loss_rpn_box_reg
 
-        # 檢查每個 loss 是否為有限值
+        # 防呆：略過非有限值
         if any(not torch.isfinite(val) for val in loss_dict.values()):
             print("[Warn] Non-finite loss dict, skip this batch.")
             continue
-
         loss = sum(loss_dict.values())
         if not torch.isfinite(loss):
             print("[Warn] total loss is NaN/Inf, skip this batch.")
@@ -98,7 +92,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch_idx, total_epochs, g
         total_loss += l_total
         num_batches += 1
 
-        # 個別分項（有些版本 key 可能不同，用 get 並設 0.0 預設）
+        # 分項（容錯 key）
         l_obj = float(loss_dict.get("loss_objectness",   torch.tensor(0.0)).item())
         l_rpn = float(loss_dict.get("loss_rpn_box_reg",  torch.tensor(0.0)).item())
         l_cls = float(loss_dict.get("loss_classifier",   torch.tensor(0.0)).item())
@@ -128,16 +122,15 @@ def train_one_epoch(model, loader, optimizer, device, epoch_idx, total_epochs, g
     return avg_loss, epoch_time
 
 
-def quick_sanity_check(model, device):
-    """用 batch_size=1 快測 forward/backward 是否能跑通"""
-    ds = PigsDataset("data/train/img", "data/train/gt.txt",
-                     transforms=get_transforms(train=True, max_side=640))
-    loader = DataLoader(ds, batch_size=1, shuffle=True, 
-                        num_workers=6, 
-                        pin_memory=True, 
-                        persistent_workers=True, 
-                        prefetch_factor=4,
-                        collate_fn=collate_fn)
+def quick_sanity_check(model, device, cfg):
+    """ batch_size=1 快測 forward/backward 是否能跑通 """
+    ds = PigsDataset(cfg["data"]["train_img_dir"], cfg["data"]["train_gt"],
+                     transforms=get_transforms(train=True, max_side=cfg["sanity_check"]["max_side"]))
+    loader = DataLoader(
+        ds, batch_size=cfg["sanity_check"]["batch_size"], shuffle=True,
+        num_workers=cfg["data"]["num_workers"], pin_memory=True,
+        persistent_workers=True, prefetch_factor=4, collate_fn=collate_fn
+    )
     model.train()
     params = [p for p in model.parameters() if p.requires_grad]
     optim = torch.optim.SGD(params, lr=0.01, momentum=0.9)
@@ -152,45 +145,79 @@ def quick_sanity_check(model, device):
 
 
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.backends.cudnn.benchmark = True
+    # 以 train.py 的位置推回到專案根目錄，再拼 config 路徑
+    project_root = Path(__file__).resolve().parents[1]
+    cfg_file = project_root / CFG_PATH
+
+    # 讀設定（支援檔頭 OVERRIDES）
+    cfg = load_cfg(str(cfg_file), overrides=OVERRIDES)
+
+    # （可選）強制覆寫 sanity_check 開關
+    if SANITY_CHECK_FORCE is not None:
+        cfg["sanity_check"]["enabled"] = bool(SANITY_CHECK_FORCE)
+
+    device = torch.device("cuda" if torch.cuda.is_available() and cfg["device"]["cuda"] else "cpu")
+    torch.backends.cudnn.benchmark = cfg["train"]["cudnn_benchmark"]
 
     # === 建模 ===
-    model = get_fasterrcnn_r50_fpn(num_classes=2, freeze_backbone=FREEZE_BB).to(device)
+    model = get_fasterrcnn_r50_fpn(
+        num_classes=cfg["model"]["num_classes"],
+        freeze_backbone=cfg["model"]["freeze_backbone"]
+    ).to(device)
 
-    # === Sanity Check（小 batch）===
-    quick_sanity_check(model, device)
+    # === Sanity Check ===
+    if cfg["sanity_check"]["enabled"]:
+        quick_sanity_check(model, device, cfg)
 
     # === 資料 ===
-    train_ds = PigsDataset("data/train/img", "data/train/gt.txt",
-                           transforms=get_transforms(train=True, max_side=MAX_SIDE))
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
-                              num_workers=NUM_WORKERS, pin_memory=True, 
-                              persistent_workers=True, prefetch_factor=4, 
-                              collate_fn=collate_fn)
+    train_ds = PigsDataset(
+        cfg["data"]["train_img_dir"],
+        cfg["data"]["train_gt"],
+        transforms=get_transforms(train=True, max_side=cfg["augment"]["max_side"])
+    )
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=cfg["train"]["batch_size"],
+        shuffle=True,
+        num_workers=cfg["data"]["num_workers"],
+        pin_memory=cfg["dataloader"]["pin_memory"],
+        persistent_workers=cfg["dataloader"]["persistent_workers"],
+        prefetch_factor=cfg["dataloader"]["prefetch_factor"],
+        collate_fn=collate_fn
+    )
 
     # === 優化器與學習率排程 ===
-    params    = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.SGD(params, lr=LR, momentum=0.9, weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=STEP_SIZE, gamma=GAMMA)
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.SGD(
+        params,
+        lr=cfg["optimizer"]["lr"],
+        momentum=cfg["optimizer"]["momentum"],
+        weight_decay=cfg["optimizer"]["weight_decay"]
+    )
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer,
+        step_size=cfg["scheduler"]["step_size"],
+        gamma=cfg["scheduler"]["gamma"]
+    )
 
-    os.makedirs(CKPT_DIR, exist_ok=True)
-
-    # === 正式訓練 ===
+    # === 訓練 ===
+    os.makedirs(cfg["checkpoint"]["dir"], exist_ok=True)
     total_t0 = time.perf_counter()
-    for epoch in range(EPOCHS):
+    for epoch in range(cfg["train"]["epochs"]):
         avg_loss, epoch_time = train_one_epoch(
             model, train_loader, optimizer, device,
-            epoch_idx=epoch, total_epochs=EPOCHS, grad_clip=GRAD_CLIP
+            epoch_idx=epoch, total_epochs=cfg["train"]["epochs"],
+            grad_clip=cfg["train"]["grad_clip"]
         )
         scheduler.step()
     total_time = time.perf_counter() - total_t0
 
-    # === 只存最後一個權重 ===
-    ckpt_path = os.path.join(CKPT_DIR, CKPT_NAME)
+    # === 保存（只存最後一個） ===
+    ckpt_path = os.path.join(cfg["checkpoint"]["dir"], cfg["checkpoint"]["name"])
     torch.save(model.state_dict(), ckpt_path)
     print(f"[Save Final] {ckpt_path}")
     print(f"[Done] Total training time: {total_time/60:.1f} min")
+
 
 if __name__ == "__main__":
     main()

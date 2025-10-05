@@ -1,0 +1,83 @@
+project:
+  name: hw1_od
+  seed: 42
+  run_name: fasterrcnn_v3            # ← 這次實驗代號（會成為資料夾名）
+  output_root: experiments/logs      # ← 主輸出資料夾
+  output_dir: ${project.output_root}/${project.run_name}
+
+data:
+  root: data
+  train_img_dir: ${data.root}/train/img
+  train_gt: ${data.root}/train/gt.txt
+  test_img_dir: ${data.root}/test/img
+  val_split: 0.1
+  num_workers: 16
+  cache: false
+
+model:
+  detector: fasterrcnn_r50_fpn
+  num_classes: 2
+  freeze_backbone: false
+  pretrained: false
+
+augment:
+  max_side: 1024
+  resize: null
+  flip_p: 0.5
+  hsv: false
+  mosaic: false
+
+train:
+  epochs: 30
+  batch_size: 4
+  grad_clip: 10.0
+  amp: false
+  cudnn_benchmark: true
+
+optimizer:
+  type: sgd
+  lr: 0.003
+  weight_decay: 1.0e-4
+  momentum: 0.9
+
+scheduler:
+  type: steplr
+  step_size: 5
+  gamma: 0.1
+
+dataloader:
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
+  shuffle: true
+
+sanity_check:
+  enabled: true
+  batch_size: 1
+  max_side: 640
+
+checkpoint:
+  dir: ${project.output_dir}
+  name: ${project.run_name}.pth      # ← 模型輸出檔名
+  save_last_only: true
+  save_full_path: ${checkpoint.dir}/${checkpoint.name}
+
+logging:
+  csv_name: train_log.csv
+  csv_path: ${project.output_dir}/${logging.csv_name}
+  print_interval: 10
+
+eval:
+  iou_thresholds: [0.50,0.55,0.60,0.65,0.70,0.75,0.80,0.85,0.90,0.95]
+  max_det: 100
+  save_dir: experiments/eval_results
+  result_txt: ${eval.save_dir}/${project.run_name}_results.txt
+  result_json: ${eval.save_dir}/${project.run_name}_details.json
+
+infer:
+  score_thr: 0.05
+  nms_iou: 0.5
+  submission_csv: submissions/${project.run_name}_submission.csv
+
+device:
+  cuda: true
