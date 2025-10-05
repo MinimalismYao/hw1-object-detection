@@ -20,7 +20,7 @@ data:
 model:
   detector: fasterrcnn_r50_fpn
   backbone: resnet50
-  num_classes: 2               # 單類別任務（train.py 會自動 + 背景）
+  num_classes: 2               
   freeze_backbone: false
   pretrained: false
 
