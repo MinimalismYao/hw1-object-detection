@@ -1,359 +1,223 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-src/trainv4.py
-Faster R-CNN + ResNet50-FPN 訓練腳本（v4）
-- 參考 src/train.py 的穩定架構：tqdm、sanity check、StepLR、grad clip、專案 model 介面
-- 加上：AMP、Early Stopping（監控 val_loss 或 train_loss）、可選 Cosine+Warmup（iteration 級）
-- 已支援從 YAML 讀 anchors / RPN 參數（改在 model.py 內接 cfg）
-"""
-
-# ========= 可在這裡快速調整的區域 =========
-CFG_PATH = "experiments/configs/v5.yaml"  # 指定要讀的 YAML
-OVERRIDES = [
-    # 例："train.epochs=40", "optimizer.lr=0.0025"
-]
-SANITY_CHECK_FORCE = None  # 可填 True / False / None（None = 依 YAML）
-# ======================================
-
-import os
-import time
-import math
-from pathlib import Path
-from contextlib import nullcontext
-
+# src/modelv5.py
 import torch
-from torch.utils.data import DataLoader
-from tqdm import tqdm
+import torch.nn as nn
+import torchvision
+from typing import Any, Dict, Iterable, Optional
 
-from dataset import PigsDataset, collate_fn
-from transforms import get_transforms
-from modelv5 import get_fasterrcnn_r50_fpn          # ← 改這裡
-from config import load_cfg                       # 你專案內的 loader（支援 ${...} 與 overrides）
-
-
-# ---------------- 小工具 ----------------
-class SmoothedValue:
-    def __init__(self, alpha=0.9):
-        self.alpha = alpha
-        self.avg = None
-    def update(self, v: float):
-        self.avg = v if self.avg is None else self.alpha * self.avg + (1 - self.alpha) * v
-    def value(self):
-        return float("nan") if self.avg is None else float(self.avg)
+from torchvision.models.detection import FasterRCNN
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.detection.rpn import AnchorGenerator
+from torchvision.ops import MultiScaleRoIAlign
+from torchvision.ops.feature_pyramid_network import LastLevelMaxPool
+from torchvision.models._utils import IntermediateLayerGetter
+from torchvision.models.detection.backbone_utils import BackboneWithFPN
 
 
-class EarlyStopping:
-    def __init__(self, mode: str = "min", patience: int = 5):
-        assert mode in ("min", "max")
-        self.mode = mode
-        self.patience = patience
-        self.best = None
-        self.wait = 0
-        self.should_stop = False
-    def step(self, value: float) -> bool:
-        if self.best is None:
-            self.best = value
-            self.wait = 0
-            return True
-        improved = (value < self.best) if self.mode == "min" else (value > self.best)
-        if improved:
-            self.best = value
-            self.wait = 0
-            return True
-        self.wait += 1
-        if self.wait >= self.patience:
-            self.should_stop = True
-        return False
+# -------------------------- utils --------------------------
+def _as_tuple_sizes(sizes_like):
+    """
+    將多種寫法轉成 AnchorGenerator 需要的格式：
+      A) [[8], [16], [32], [64], [128]]
+      B) [8, 16, 32, 64, 128]
+      C) 8
+    皆會轉成：((8,), (16,), (32,), (64,), (128,))
+    """
+    if sizes_like is None:
+        return None
 
+    # C) 單一數值
+    if isinstance(sizes_like, (int, float)):
+        return ((int(sizes_like),),)
 
-class WarmupCosineLR(torch.optim.lr_scheduler._LRScheduler):
-    """以 iteration 為單位的 Warmup + Cosine"""
-    def __init__(self, optimizer, warmup_iters, total_iters, eta_min=0.0, last_epoch=-1):
-        self.warmup_iters = max(1, int(warmup_iters))
-        self.total_iters = max(self.warmup_iters + 1, int(total_iters))
-        self.eta_min = float(eta_min)
-        super().__init__(optimizer, last_epoch)
-    def get_lr(self):
-        step = self.last_epoch + 1
-        lrs = []
-        for base_lr in self.base_lrs:
-            if step <= self.warmup_iters:
-                lr = base_lr * step / self.warmup_iters
+    # B) 扁平 list/tuple
+    if isinstance(sizes_like, (list, tuple)) and all(isinstance(x, (int, float)) for x in sizes_like):
+        return tuple((int(x),) for x in sizes_like)
+
+    # A) 巢狀 list/tuple 或混合
+    if isinstance(sizes_like, (list, tuple)):
+        out = []
+        for s in sizes_like:
+            if isinstance(s, (list, tuple)):
+                if len(s) == 0:
+                    continue
+                out.append(tuple(int(v) for v in s))
             else:
-                t = (step - self.warmup_iters) / (self.total_iters - self.warmup_iters)
-                lr = self.eta_min + 0.5 * (base_lr - self.eta_min) * (1 + math.cos(math.pi * t))
-            lrs.append(lr)
-        return lrs
+                out.append((int(s),))
+        return tuple(out)
+
+    raise TypeError(f"Unsupported type for rpn_anchor_sizes: {type(sizes_like)}")
 
 
-# ---------------- Sanity Check ----------------
-def quick_sanity_check(model, device, cfg):
-    """ batch_size=1 快測 forward/backward 是否能跑通（避免正式訓練才發現卡住） """
-    ds = PigsDataset(cfg["data"]["train_img_dir"], cfg["data"]["train_gt"],
-                     transforms=get_transforms(train=True, max_side=cfg["sanity_check"]["max_side"]))
-    loader = DataLoader(
-        ds, batch_size=cfg["sanity_check"]["batch_size"], shuffle=True,
-        num_workers=cfg["data"]["num_workers"], pin_memory=True,
-        persistent_workers=True, prefetch_factor=4, collate_fn=collate_fn
-    )
-    model.train()
-    params = [p for p in model.parameters() if p.requires_grad]
-    optim = torch.optim.SGD(params, lr=0.01, momentum=0.9)
-    images, targets = next(iter(loader))
-    images  = [images[0].to(device, non_blocking=True)]
-    targets = [{k: v.to(device, non_blocking=True) for k, v in targets[0].items()}]
-    loss = sum(model(images, targets).values())
-    optim.zero_grad(set_to_none=True)
-    loss.backward()
-    optim.step()
-    print(f"[Sanity] one-step OK, loss={loss.item():.4f}")
+def _maybe_get(d: Dict[str, Any], path: str, default=None):
+    """安全取得巢狀 dict 值：_maybe_get(cfg, 'model.rpn_nms_thresh', 0.7)"""
+    cur = d
+    for k in path.split("."):
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
 
 
-# ---------------- 訓練 / 驗證（支援 AMP） ----------------
-def train_one_epoch(model, loader, optimizer, device, epoch_idx, total_epochs,
-                    grad_clip=10.0, amp=False, scaler=None,
-                    scheduler_iter=None) -> float:
-    model.train()
-    total_loss, num_batches = 0.0, 0
+# --------------------- backbone (ResNet50-FPN) ---------------------
+def _build_resnet50_fpn(
+    pretrained_backbone: bool = False,
+    norm_layer=nn.BatchNorm2d,
+) -> BackboneWithFPN:
+    """
+    建 ResNet50 + FPN：
+    - 預設 from scratch（pretrained_backbone=False）
+    - 使用可學習 BN（from scratch 收斂較穩）
+    - 輸出 256 維通道的 FPN，並加上 P6（LastLevelMaxPool）
+    """
+    # 1) ResNet50
+    if pretrained_backbone:
+        try:
+            weights = torchvision.models.ResNet50_Weights.DEFAULT
+        except AttributeError:
+            weights = "IMAGENET1K_V1"
+        resnet = torchvision.models.resnet50(weights=weights, norm_layer=norm_layer)
+    else:
+        resnet = torchvision.models.resnet50(weights=None, norm_layer=norm_layer)
 
-    s_total  = SmoothedValue(0.9)
-    s_rpnobj = SmoothedValue(0.9)
-    s_rpnreg = SmoothedValue(0.9)
-    s_cls    = SmoothedValue(0.9)
-    s_box    = SmoothedValue(0.9)
+    # 2) 取出 C2~C5
+    return_layers = {"layer1": "0", "layer2": "1", "layer3": "2", "layer4": "3"}
+    in_channels_list = [256, 512, 1024, 2048]
+    body = IntermediateLayerGetter(resnet, return_layers=return_layers)
 
-    autocast_ctx = torch.amp.autocast("cuda") if amp else nullcontext()
-    pbar = tqdm(loader, total=len(loader), ncols=120, desc=f"Epoch {epoch_idx+1}/{total_epochs}")
+    # 3) 包成 FPN（相容不同 torchvision 版本的建構子）
+    try:
+        # 新版/部分版本簽名（具名參數可能不接受 body=，所以先用位置參數）
+        backbone = BackboneWithFPN(
+            body,
+            return_layers,
+            in_channels_list,
+            out_channels=256,
+            extra_blocks=LastLevelMaxPool(),
+        )
+    except TypeError:
+        # 極舊版可能需要完全位置參數
+        backbone = BackboneWithFPN(
+            body,
+            return_layers,
+            in_channels_list,
+            256,
+            LastLevelMaxPool(),
+        )
 
-    for step, (images, targets) in enumerate(pbar, start=1):
-        images  = [img.to(device, non_blocking=True) for img in images]
-        targets = [{k: v.to(device, non_blocking=True) for k, v in t.items()} for t in targets]
-
-        with autocast_ctx:
-            loss_dict = model(images, targets)
-            loss = sum(loss_dict.values())
-
-        optimizer.zero_grad(set_to_none=True)
-
-        # ---- optimizer.step() 一定要先執行 ----
-        opt_stepped = False
-        if amp and scaler is not None:
-            scaler.scale(loss).backward()
-            if grad_clip and grad_clip > 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-            opt_stepped = True
-        else:
-            loss.backward()
-            if grad_clip and grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], grad_clip)
-            optimizer.step()
-            opt_stepped = True
-        # --------------------------------------
-
-        # per-iteration scheduler（若有）：必須在 optimizer.step() 之後
-        if scheduler_iter is not None and opt_stepped:
-            scheduler_iter.step()
-
-        l_total = float(loss.item())
-        total_loss += l_total
-        num_batches += 1
-
-        # 分項容錯
-        l_obj = float(loss_dict.get("loss_objectness",   torch.tensor(0.0)).item())
-        l_rpn = float(loss_dict.get("loss_rpn_box_reg",  torch.tensor(0.0)).item())
-        l_cls = float(loss_dict.get("loss_classifier",   torch.tensor(0.0)).item())
-        l_box = float(loss_dict.get("loss_box_reg",      torch.tensor(0.0)).item())
-
-        s_total.update(l_total); s_rpnobj.update(l_obj); s_rpnreg.update(l_rpn); s_cls.update(l_cls); s_box.update(l_box)
-        pbar.set_postfix({
-            "loss":    f"{s_total.value():.3f}",
-            "rpn_obj": f"{s_rpnobj.value():.3f}",
-            "rpn_reg": f"{s_rpnreg.value():.3f}",
-            "cls":     f"{s_cls.value():.3f}",
-            "box":     f"{s_box.value():.3f}",
-            "lr":      f"{optimizer.param_groups[0]['lr']:.3e}",
-        })
-
-        # 釋放暫存參考，避免 Python 容器 hold 住 tensor
-        del loss_dict, loss, images, targets
-
-    avg_loss = total_loss / max(1, num_batches)
-    return avg_loss
+    return backbone  # .out_channels = 256
 
 
-@torch.no_grad()
-def validate_one_epoch(model, loader, device, amp=False) -> float:
-    # eval() 下不回 loss；採 train()+no_grad() 技巧
-    model.train()
-    total, n = 0.0, 0
-    autocast_ctx = torch.amp.autocast("cuda") if amp else nullcontext()
-    for images, targets in loader:
-        images  = [img.to(device, non_blocking=True) for img in images]
-        targets = [{k: v.to(device, non_blocking=True) for k, v in t.items()} for t in targets]
-        with autocast_ctx:
-            loss_dict = model(images, targets)
-            loss = sum(loss_dict.values()).float()
-        total += float(loss.item()); n += 1
-        del loss_dict, loss, images, targets
-    return total / max(1, n)
+# --------------------- model builder ---------------------
+def get_fasterrcnn_r50_fpn(
+    num_classes: int = 2,
+    freeze_backbone: bool = False,
+    *,
+    # 可直接由參數控制（若傳了 cfg，會以 cfg 為優先，參數為後備）
+    min_size: Optional[int] = None,
+    max_size: Optional[int] = None,
+    image_mean: Iterable[float] = (0.0, 0.0, 0.0),
+    image_std: Iterable[float] = (1.0, 1.0, 1.0),
+    rpn_anchor_sizes: Optional[Iterable] = None,
+    rpn_anchor_ratios: Iterable[float] = (0.5, 1.0, 2.0),
+    rpn_pre_nms_top_n_train: int = 2000,
+    rpn_pre_nms_top_n_test: int = 1000,
+    rpn_post_nms_top_n_train: int = 1000,
+    rpn_post_nms_top_n_test: int = 1000,
+    rpn_nms_thresh: float = 0.7,
+    box_score_thresh: float = 0.05,
+    box_nms_thresh: float = 0.5,
+    box_detections_per_img: int = 100,
+    pretrained_backbone: bool = False,
+    # 允許把完整 cfg 傳進來（優先使用）
+    cfg: Optional[Dict[str, Any]] = None,
+) -> FasterRCNN:
+    """
+    Faster R-CNN (ResNet50-FPN)
+    - 預設 from scratch；可切為 pretrained_backbone=True
+    - 支援從 cfg 或函式參數設定 Transform / RPN / ROI / anchors
+    """
 
+    # ---- 1) 從 cfg 取值（若存在） ----
+    mcfg = _maybe_get(cfg or {}, "model", {}) if cfg else {}
+    acfg = _maybe_get(cfg or {}, "augment", {}) if cfg else {}
 
-# ---------------- Main ----------------
-def main():
-    # 用專案的 load_cfg（支援 ${...} 與 overrides）
-    project_root = Path(__file__).resolve().parents[1]
-    cfg_file = project_root / CFG_PATH
-    cfg = load_cfg(str(cfg_file), overrides=OVERRIDES)
+    # Transform 尺寸：若沒指定，嘗試沿用 augment.max_side；否則 fallback 1024
+    min_size = _maybe_get(cfg or {}, "model.min_size", min_size)
+    max_size = _maybe_get(cfg or {}, "model.max_size", max_size)
+    if min_size is None and acfg:
+        min_size = int(acfg.get("max_side", 1024))
+    if max_size is None and acfg:
+        max_size = int(acfg.get("max_side", 1024))
+    if min_size is None: min_size = 1024
+    if max_size is None: max_size = 1024
 
-    # 可強制開/關 sanity check
-    if SANITY_CHECK_FORCE is not None:
-        cfg["sanity_check"]["enabled"] = bool(SANITY_CHECK_FORCE)
+    # Anchors
+    rpn_anchor_sizes = _maybe_get(cfg or {}, "model.rpn_anchor_sizes", rpn_anchor_sizes)
+    sizes_tuple = _as_tuple_sizes(rpn_anchor_sizes) if rpn_anchor_sizes is not None else ((32,), (64,), (128,), (256,), (512,))
+    rpn_anchor_ratios = _maybe_get(cfg or {}, "model.rpn_anchor_ratios", list(rpn_anchor_ratios))
 
-    device = torch.device("cuda" if torch.cuda.is_available() and cfg["device"]["cuda"] else "cpu")
-    torch.backends.cudnn.benchmark = cfg["train"]["cudnn_benchmark"]
-    print(f"[Device] {device}")
+    # RPN / ROI
+    rpn_pre_nms_top_n_train = int(_maybe_get(cfg or {}, "model.rpn_pre_nms_top_n_train", rpn_pre_nms_top_n_train))
+    rpn_post_nms_top_n_train = int(_maybe_get(cfg or {}, "model.rpn_post_nms_top_n_train", rpn_post_nms_top_n_train))
+    rpn_pre_nms_top_n_test  = int(_maybe_get(cfg or {}, "model.rpn_pre_nms_top_n_test",  rpn_pre_nms_top_n_test))
+    rpn_post_nms_top_n_test = int(_maybe_get(cfg or {}, "model.rpn_post_nms_top_n_test", rpn_post_nms_top_n_test))
+    rpn_nms_thresh = float(_maybe_get(cfg or {}, "model.rpn_nms_thresh", rpn_nms_thresh))
 
-    # === 建模（把 cfg 傳進去，讓 anchors/RPN 參數生效） ===
-    model = get_fasterrcnn_r50_fpn(
-        num_classes=cfg["model"]["num_classes"],
-        freeze_backbone=cfg["model"]["freeze_backbone"],
-        cfg=cfg                                  # ← 關鍵：把 YAML 傳入
-    ).to(device)
+    # Inference（外部 eval/infer 仍可再做閾值/NMS，這裡是 RCNN 內部的）
+    box_score_thresh = float(_maybe_get(cfg or {}, "model.box_score_thresh", box_score_thresh))
+    box_nms_thresh   = float(_maybe_get(cfg or {}, "model.box_nms_thresh",   box_nms_thresh))
+    box_detections_per_img = int(_maybe_get(cfg or {}, "model.box_detections_per_img", box_detections_per_img))
 
-    # === Sanity Check ===
-    if cfg["sanity_check"]["enabled"]:
-        quick_sanity_check(model, device, cfg)
+    pretrained_backbone = bool(_maybe_get(cfg or {}, "model.pretrained_backbone", pretrained_backbone))
+    freeze_backbone     = bool(_maybe_get(cfg or {}, "model.freeze_backbone", freeze_backbone))
 
-    # === Data ===
-    train_ds = PigsDataset(
-        cfg["data"]["train_img_dir"],
-        cfg["data"]["train_gt"],
-        transforms=get_transforms(train=True, max_side=cfg["augment"]["max_side"])
-    )
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=cfg["train"]["batch_size"],
-        shuffle=cfg["dataloader"]["shuffle"],
-        num_workers=cfg["data"]["num_workers"],
-        pin_memory=cfg["dataloader"]["pin_memory"],
-        persistent_workers=cfg["dataloader"]["persistent_workers"],
-        prefetch_factor=cfg["dataloader"]["prefetch_factor"],
-        collate_fn=collate_fn,
-        drop_last=False,
+    # ---- 2) Backbone + FPN ----
+    backbone = _build_resnet50_fpn(pretrained_backbone=pretrained_backbone, norm_layer=nn.BatchNorm2d)
+
+    # ---- 3) Anchors / RoIAlign ----
+    # sizes_tuple 例如：((8,), (16,), (32,), (64,), (128,))
+    anchor_generator = AnchorGenerator(
+        sizes=sizes_tuple,
+        aspect_ratios=(tuple(float(r) for r in rpn_anchor_ratios),) * len(sizes_tuple),
     )
 
-    val_loader = None
-    if os.path.isdir(cfg["data"]["val_img_dir"]) and os.path.exists(cfg["data"]["val_gt"]):
-        val_ds = PigsDataset(
-            cfg["data"]["val_img_dir"],
-            cfg["data"]["val_gt"],
-            transforms=get_transforms(train=False, max_side=cfg["augment"]["max_side"])
-        )
-        val_loader = DataLoader(
-            val_ds,
-            batch_size=cfg["train"]["batch_size"],
-            shuffle=False,
-            num_workers=cfg["data"]["num_workers"],
-            pin_memory=cfg["dataloader"]["pin_memory"],
-            persistent_workers=cfg["dataloader"]["persistent_workers"],
-            prefetch_factor=cfg["dataloader"]["prefetch_factor"],
-            collate_fn=collate_fn,
-            drop_last=False,
-        )
-        print(f"[Data] val set enabled: {len(val_ds)} samples")
-    else:
-        print("[Data] no validation set configured; will monitor train loss for early stopping")
+    # ROI 常用設定：用 P2~P5；P6 交由 RPN 使用即可
+    roi_pooler = MultiScaleRoIAlign(
+        featmap_names=["0", "1", "2", "3"],
+        output_size=7,
+        sampling_ratio=2,
+    )
 
-    # === Optimizer ===
-    params = [p for p in model.parameters() if p.requires_grad]
-    if cfg["optimizer"]["type"].lower() == "adamw":
-        optimizer = torch.optim.AdamW(params, lr=cfg["optimizer"]["lr"], weight_decay=cfg["optimizer"]["weight_decay"])
-    else:
-        optimizer = torch.optim.SGD(
-            params,
-            lr=cfg["optimizer"]["lr"],
-            momentum=cfg["optimizer"]["momentum"],
-            weight_decay=cfg["optimizer"]["weight_decay"]
-        )
+    # ---- 4) FasterRCNN 主體（顯式指定 Transform 與 RPN/ROI 參數）----
+    model = FasterRCNN(
+        backbone=backbone,
+        num_classes=num_classes,  # 背景+1類 = 2
+        rpn_anchor_generator=anchor_generator,
+        box_roi_pool=roi_pooler,
+        # GeneralizedRCNNTransform（與你的前處理協同）
+        min_size=int(min_size),
+        max_size=int(max_size),
+        image_mean=list(image_mean),
+        image_std=list(image_std),
+        # RPN
+        rpn_pre_nms_top_n_train=int(rpn_pre_nms_top_n_train),
+        rpn_pre_nms_top_n_test=int(rpn_pre_nms_top_n_test),
+        rpn_post_nms_top_n_train=int(rpn_post_nms_top_n_train),
+        rpn_post_nms_top_n_test=int(rpn_post_nms_top_n_test),
+        rpn_nms_thresh=float(rpn_nms_thresh),
+        # ROI / Inference
+        box_score_thresh=float(box_score_thresh),
+        box_nms_thresh=float(box_nms_thresh),
+        box_detections_per_img=int(box_detections_per_img),
+    )
 
-    # === Scheduler：支援 StepLR 或 Cosine+Warmup ===
-    scheduler_epoch = None
-    scheduler_iter = None
-    if cfg["scheduler"]["type"].lower() == "cosine":
-        iters_per_epoch = max(1, len(train_loader))
-        total_iters = iters_per_epoch * cfg["train"]["epochs"]
-        warmup_iters = min(1000, 2 * iters_per_epoch)
-        eta_min = cfg["optimizer"]["lr"] * 0.01
-        scheduler_iter = WarmupCosineLR(optimizer, warmup_iters, total_iters, eta_min=eta_min)
-    else:
-        scheduler_epoch = torch.optim.lr_scheduler.StepLR(
-            optimizer,
-            step_size=cfg["scheduler"]["step_size"],
-            gamma=cfg["scheduler"]["gamma"]
-        )
+    # ---- 5) 凍結 backbone（如需）----
+    if freeze_backbone:
+        for p in model.backbone.parameters():
+            p.requires_grad_(False)
 
-    # === AMP / EarlyStop ===
-    use_amp = bool(cfg["train"]["amp"])
-    scaler = torch.amp.GradScaler("cuda") if (use_amp and device.type == "cuda") else None
+    # ---- 6) 保險：替換分類頭以確保 num_classes 正確 ----
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
 
-    es_cfg = cfg["early_stop"]
-    use_es = bool(es_cfg["enabled"])
-    es = EarlyStopping(mode=str(es_cfg["mode"]), patience=int(es_cfg["patience"])) if use_es else None
-
-    # === I/O ===
-    os.makedirs(cfg["checkpoint"]["dir"], exist_ok=True)
-    best_path = os.path.join(cfg["checkpoint"]["dir"], es_cfg.get("best_name", "best.pth"))
-    last_path = cfg["checkpoint"].get("save_full_path") or os.path.join(cfg["checkpoint"]["dir"], cfg["checkpoint"]["name"])
-
-    # === Loop ===
-    print(f"[Train] epochs={cfg['train']['epochs']}, batch_size={cfg['train']['batch_size']}, amp={use_amp}")
-    total_t0 = time.perf_counter()
-
-    for epoch in range(cfg["train"]["epochs"]):
-        avg_loss = train_one_epoch(
-            model, train_loader, optimizer, device,
-            epoch_idx=epoch, total_epochs=cfg["train"]["epochs"],
-            grad_clip=cfg["train"]["grad_clip"], amp=use_amp, scaler=scaler,
-            scheduler_iter=scheduler_iter
-        )
-
-        # epoch 級 scheduler：必須在該 epoch 已經做過 optimizer.step() 之後
-        if scheduler_epoch is not None:
-            scheduler_epoch.step()
-
-        # 驗證 / 早停
-        if val_loader is not None:
-            val_loss = validate_one_epoch(model, val_loader, device, amp=use_amp)
-            print(f"[Val ] epoch {epoch+1}/{cfg['train']['epochs']} val_loss={val_loss:.4f}")
-            monitored = val_loss
-        else:
-            monitored = avg_loss
-
-        if use_es:
-            improved = es.step(monitored)
-            if improved and bool(es_cfg.get("save_best", True)):
-                torch.save(model.state_dict(), best_path)
-                print(f"[EarlyStop] New best ({monitored:.4f}). Saved -> {best_path}")
-            if es.should_stop:
-                print(f"[EarlyStop] No improvement for {es_cfg['patience']} epochs. Stop at epoch {epoch+1}.")
-                break
-
-    total_time = time.perf_counter() - total_t0
-    print(f"[Done] total_time={total_time/60:.2f} min")
-
-    # 保存最後
-    state = model.state_dict()
-    if cfg["checkpoint"].get("save_fp16", False):
-        state = {k: v.half() for k, v in state.items()}
-    torch.save(state, last_path)
-    print(f"[Save Last] {last_path}")
-    if use_es and os.path.exists(best_path):
-        print(f"[Best Model] {best_path}")
-
-
-if __name__ == "__main__":
-    main()
+    return model

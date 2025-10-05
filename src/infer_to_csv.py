@@ -2,61 +2,61 @@
 # -*- coding: utf-8 -*-
 """
 src/infer_to_csv.py
----------------------------------
-依 Kaggle submission 格式輸出：
+輸出 Kaggle 需要的:
 Image_ID,PredictionString
-1,<conf_1> <x_1> <y_1> <w_1> <h_1> <class_1> <conf_2> <x_2> <y_2> <w_2> <h_2> <class_2> ...
+每張圖都要有一列；<class> 固定 0；座標需反標準化回原圖空間。
 """
 
 from pathlib import Path
-import pandas as pd
+import csv
 import torch
 import torchvision
 from PIL import Image
+from torchvision.ops import nms
+from torchvision.transforms import functional as TF
 from tqdm import tqdm
 
 from config import load_cfg
 from modelv4 import get_fasterrcnn_r50_fpn
 
-# ========= 可在這裡快速覆寫設定（可留空） =========
+# ========= 覆寫設定（可留空） =========
 CFG_PATH = "experiments/configs/v4.yaml"
 OVERRIDES = [
     "checkpoint.save_full_path=experiments/logs/fasterrcnn_v4.9/fasterrcnn_v4.9_best.pth",
-    "project.run_name=fasterrcnn_v4_9_best",  # 只影響輸出檔名
+    "project.run_name=fasterrcnn_v4_9_best",
 ]
-# =================================================
+# ====================================
 
 
-def list_images(img_dir: str):
-    """列出所有影像檔（依檔名排序，支援多格式）"""
+def list_images_sorted(img_dir: str):
     p = Path(img_dir)
-    files = []
-    for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp"):
-        files.extend(p.glob(ext))
+    files = [*p.glob("*.jpg"), *p.glob("*.jpeg"), *p.glob("*.png"), *p.glob("*.bmp")]
+    # 以數字檔名優先排序，否則以字典序
     def _key(fp: Path):
-        s = fp.stem.lstrip("0")
-        return int(s) if s.isdigit() else fp.stem
+        stem = fp.stem.lstrip("0")
+        return (0, int(stem)) if stem.isdigit() else (1, fp.stem)
     return sorted(files, key=_key)
 
 
-def resize_keep_max_side(pil_img: Image.Image, max_side: int) -> Image.Image:
-    w, h = pil_img.size
-    if max(w, h) <= max_side:
-        return pil_img
-    scale = float(max_side) / max(w, h)
-    new_w, new_h = int(round(w * scale)), int(round(h * scale))
-    return pil_img.resize((new_w, new_h), resample=Image.BILINEAR)
+def resize_keep_max_side(img: Image.Image, max_side: int):
+    """回傳 (resized_img, scale)。scale = resized / original"""
+    w, h = img.size
+    m = max(w, h)
+    if m <= max_side:
+        return img, 1.0
+    s = float(max_side) / m
+    new_w, new_h = int(round(w * s)), int(round(h * s))
+    return img.resize((new_w, new_h), Image.BILINEAR), s
 
 
 def xyxy_to_xywh(boxes: torch.Tensor) -> torch.Tensor:
-    boxes = boxes.clone()
-    boxes[:, 2] = boxes[:, 2] - boxes[:, 0]
-    boxes[:, 3] = boxes[:, 3] - boxes[:, 1]
-    return boxes
+    xywh = boxes.clone()
+    xywh[:, 2] = xywh[:, 2] - xywh[:, 0]
+    xywh[:, 3] = xywh[:, 3] - xywh[:, 1]
+    return xywh
 
 
 def _state_to_fp32(state):
-    """若 .pth 是半精度（float16），自動轉回 float32 再載入。"""
     for k, v in list(state.items()):
         if isinstance(v, torch.Tensor) and v.is_floating_point() and v.dtype == torch.float16:
             state[k] = v.float()
@@ -65,90 +65,104 @@ def _state_to_fp32(state):
 
 @torch.inference_mode()
 def main():
-    # === 讀取設定 ===
+    # 讀設定
     project_root = Path(__file__).resolve().parents[1]
     cfg = load_cfg(str(project_root / CFG_PATH), overrides=OVERRIDES)
 
-    # ✅ 取得 ckpt：優先 save_full_path，否則用 dir/name
     ckpt_cfg = cfg["checkpoint"]
     ckpt_path = Path(ckpt_cfg.get("save_full_path") or (Path(ckpt_cfg["dir"]) / ckpt_cfg["name"]))
-    img_dir   = Path(cfg["data"]["test_img_dir"])
-    out_csv   = Path(cfg["infer"]["submission_csv"])
+    test_dir = Path(cfg["data"]["test_img_dir"])
+    out_csv = Path(cfg["infer"]["submission_csv"])
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
 
     assert ckpt_path.exists(), f"找不到權重檔：{ckpt_path}"
-    assert img_dir.exists(),   f"找不到測試影像資料夾：{img_dir}"
-    print(f"[Using checkpoint] {ckpt_path}")
+    assert test_dir.exists(), "找不到測試影像資料夾"
 
-    # === 裝置 ===
     device = torch.device("cuda" if torch.cuda.is_available() and cfg["device"]["cuda"] else "cpu")
 
-    # === 載入模型 ===
+    # 模型
     model = get_fasterrcnn_r50_fpn(
-        num_classes=cfg["model"]["num_classes"],
-        freeze_backbone=cfg["model"]["freeze_backbone"]
+        num_classes=int(cfg["model"]["num_classes"]),   # 你 YAML 已含背景（=2）
+        freeze_backbone=bool(cfg["model"]["freeze_backbone"])
     ).to(device)
-
     try:
-        state = torch.load(str(ckpt_path), map_location=device, weights_only=True)
+        state = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
     except TypeError:
-        state = torch.load(str(ckpt_path), map_location=device)
-    state = _state_to_fp32(state)  # 若是 fp16 就轉回 fp32
-    model.load_state_dict(state)
+        state = torch.load(str(ckpt_path), map_location="cpu")
+    model.load_state_dict(_state_to_fp32(state), strict=True)
     model.eval()
 
-    # === 推論設定 ===
+    # 推論設定
     score_thr = float(cfg["infer"]["score_thr"])
     nms_iou   = float(cfg["infer"]["nms_iou"])
     max_side  = int(cfg["augment"]["max_side"])
+    max_det   = int(cfg.get("eval", {}).get("max_det", 100))
 
-    img_files = list_images(str(img_dir))
-    if len(img_files) == 0:
-        raise FileNotFoundError(f"未找到任何影像於 {img_dir}")
+    imgs = list_images_sorted(str(test_dir))
+    assert len(imgs) > 0, "測試資料夾沒有影像"
 
-    to_tensor = torchvision.transforms.ToTensor()
-    results = []
+    print(f"[Infer] images={len(imgs)}  thr={score_thr}  nms={nms_iou}  max_side={max_side}  max_det={max_det}")
+    print(f"[CKPT ] {ckpt_path}")
+    print(f"[OUT  ] {out_csv}")
 
-    print(f"[Infer] Using {len(img_files)} images from {img_dir}")
-    print(f"[Infer] Score threshold={score_thr}, NMS IoU={nms_iou}, max_side={max_side}")
-    print(f"[Infer] Output CSV: {out_csv}")
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["Image_ID", "PredictionString"])
 
-    for fp in tqdm(img_files, ncols=100, desc="Infer"):
-        stem = fp.stem.lstrip("0")
-        image_id = int(stem) if stem != "" else 0  # 00000002.jpg -> 2
-        img = Image.open(fp).convert("RGB")
-        img = resize_keep_max_side(img, max_side=max_side)
-        x = to_tensor(img).to(device).unsqueeze(0)
+        for img_id, fp in tqdm(list(enumerate(imgs, start=1)), ncols=100, desc="Infer"):
+            pil = Image.open(fp).convert("RGB")
+            W0, H0 = pil.size
+            resized, scale = resize_keep_max_side(pil, max_side)
+            tensor = TF.to_tensor(resized).to(device)
 
-        out = model(x)[0]
-        boxes  = out["boxes"].detach().cpu()
-        scores = out["scores"].detach().cpu()
+            out = model([tensor])[0]
+            boxes  = out["boxes"]      # xyxy on resized space
+            scores = out["scores"]
+            labels = out["labels"]
 
-        # 閾值過濾
-        keep = scores >= score_thr
-        boxes, scores = boxes[keep], scores[keep]
+            # 保留前景類（label==1），並做 NMS + threshold
+            keep = (labels == 1) & (scores >= score_thr)
+            boxes, scores = boxes[keep], scores[keep]
 
-        # NMS
-        if len(boxes) > 0:
-            keep_idx = torchvision.ops.nms(boxes, scores, nms_iou)
-            boxes, scores = boxes[keep_idx], scores[keep_idx]
+            if boxes.numel() > 0:
+                keep = nms(boxes, scores, nms_iou)
+                boxes, scores = boxes[keep], scores[keep]
 
-        boxes_xywh = xyxy_to_xywh(boxes)
-        parts = []
-        for b, s in zip(boxes_xywh.tolist(), scores.tolist()):
-            x1, y1, w, h = [round(float(v), 2) for v in b]
-            conf = round(float(s), 4)
-            cls = 0  # pigs 固定 class=0
-            # <conf> <x> <y> <w> <h> <class>
-            parts.extend([conf, x1, y1, w, h, cls])
-        pred_str = " ".join(map(str, parts))
-        results.append([image_id, pred_str])
+            # 反標準化回原圖座標
+            if scale != 1.0 and boxes.numel() > 0:
+                boxes = boxes / float(scale)
 
-    # === 寫出 CSV（Kaggle submission 格式） ===
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-    df = pd.DataFrame(results, columns=["Image_ID", "PredictionString"])
-    df.to_csv(out_csv, index=False)
-    print(f"[Done] 已輸出 submission：{out_csv} ({len(results)} 張影像)")
+            # clip 到原圖邊界
+            if boxes.numel() > 0:
+                x1 = boxes[:, 0].clamp_(0, W0 - 1)
+                y1 = boxes[:, 1].clamp_(0, H0 - 1)
+                x2 = boxes[:, 2].clamp_(0, W0 - 1)
+                y2 = boxes[:, 3].clamp_(0, H0 - 1)
+                boxes = torch.stack([x1, y1, x2, y2], dim=1)
 
+            # 轉 xywh、取 top-k（≤100）
+            if boxes.numel() > 0:
+                boxes = xyxy_to_xywh(boxes)
+                if boxes.shape[0] > max_det:
+                    topk = torch.topk(scores, k=max_det)
+                    boxes, scores = boxes[topk.indices], topk.values
+
+            # 組 PredictionString（整數像素更保險；class 固定 0）
+            parts = []
+            if boxes.numel() > 0:
+                boxes = boxes.cpu().numpy()
+                scores = scores.cpu().numpy()
+                for (x, y, w_, h_), conf in zip(boxes, scores):
+                    if w_ <= 0 or h_ <= 0:
+                        continue
+                    parts += [f"{conf:.4f}", f"{int(round(x))}", f"{int(round(y))}",
+                              f"{int(round(w_))}", f"{int(round(h_))}", "0"]
+
+            predstr = " ".join(parts)  # 無檢出時為空字串
+            w.writerow([img_id, predstr])
+
+    print(f"[Done] CSV saved -> {out_csv}")
+    
 
 if __name__ == "__main__":
     main()
