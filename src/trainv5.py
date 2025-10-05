@@ -28,7 +28,7 @@ from tqdm import tqdm
 
 from dataset import PigsDataset, collate_fn
 from transforms import get_transforms
-from model import get_fasterrcnn_r50_fpn          # ← 改這裡
+from modelv5 import get_fasterrcnn_r50_fpn          # ← 改這裡
 from config import load_cfg                       # 你專案內的 loader（支援 ${...} 與 overrides）
 
 

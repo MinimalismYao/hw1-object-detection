@@ -16,13 +16,13 @@ from PIL import Image
 from tqdm import tqdm
 
 from config import load_cfg
-from src.modelv4 import get_fasterrcnn_r50_fpn
+from modelv4 import get_fasterrcnn_r50_fpn
 
 # ========= 可在這裡快速覆寫設定（可留空） =========
 CFG_PATH = "experiments/configs/v4.yaml"
 OVERRIDES = [
-    #"checkpoint.save_full_path=experiments/logs/fasterrcnn_v4/fasterrcnn_v4_best.pth",
-    #"project.run_name=fasterrcnn_v4_best.pth",  
+    "checkpoint.save_full_path=experiments/logs/fasterrcnn_v4.9/fasterrcnn_v4.9_best.pth",
+    "project.run_name=fasterrcnn_v4_9_best",  # 只影響輸出檔名
 ]
 # =================================================
 
