@@ -1,7 +1,7 @@
 project:
   name: hw1_od
   seed: 42
-  run_name: fasterrcnn_v3            # ← 這次實驗代號（會成為資料夾名）
+  run_name: fasterrcnn_v4            # ← 這次實驗代號（會成為資料夾名）
   output_root: experiments/logs      # ← 主輸出資料夾
   output_dir: ${project.output_root}/${project.run_name}
 
@@ -91,3 +91,11 @@ early_stop:
   patience: 5
   save_best: true
   best_name: ${project.run_name}_best.pth
+
+
+rpn:
+  pre_nms_topk_train: 2000
+  post_nms_topk_train: 1000
+  pre_nms_topk_test: 4000
+  post_nms_topk_test: 2000
+  nms_thr: 0.7
