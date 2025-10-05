@@ -1,22 +1,26 @@
+# ===== 顶層必要鍵（供現版 train.py 使用） =====
+seed: 42                     # ★新增：train.py 讀的是頂層 seed
+
 project:
   name: hw1_od
-  seed: 42
-  run_name: fasterrcnn_v4            # ← 這次實驗代號（會成為資料夾名）
-  output_root: experiments/logs      # ← 主輸出資料夾
+  seed: 42                   # 保留給其他腳本
+  run_name: fasterrcnn_v4
+  output_root: experiments/logs
   output_dir: ${project.output_root}/${project.run_name}
 
 data:
   root: data
   train_img_dir: ${data.root}/train/img
   train_gt: ${data.root}/train/gt.txt
-  val_img_dir: ${data.root}/val/img      
-  val_gt: ${data.root}/val/gt_val.txt   
+  val_img_dir: ${data.root}/val/img
+  val_gt: ${data.root}/val/gt_val.txt
   test_img_dir: ${data.root}/test/img
   num_workers: 16
 
 model:
-  detector: fasterrcnn_r50_fpn
-  num_classes: 2
+  detector: fasterrcnn_r50_fpn   # 保留給其他腳本
+  backbone: resnet50             # ★新增：train.py 需要的鍵
+  num_classes: 1                 # ★修正：單類別任務 → 1（train.py 會自動 + 背景）
   freeze_backbone: false
   pretrained: false
 
@@ -58,7 +62,7 @@ sanity_check:
 
 checkpoint:
   dir: ${project.output_dir}
-  name: ${project.run_name}.pth     
+  name: ${project.run_name}.pth
   save_last_only: true
   save_full_path: ${checkpoint.dir}/${checkpoint.name}
 
@@ -83,15 +87,13 @@ infer:
 device:
   cuda: true
 
-
 early_stop:
   enabled: true
-  monitor: val_loss   # 也可以用 train_loss
+  monitor: val_loss
   mode: min
   patience: 5
   save_best: true
   best_name: ${project.run_name}_best.pth
-
 
 rpn:
   pre_nms_topk_train: 2000
