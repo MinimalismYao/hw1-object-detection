@@ -21,11 +21,11 @@ from tqdm import tqdm
 import torch
 import torchvision
 
-from src.modelv4 import get_fasterrcnn_r50_fpn
+from modelv5 import get_fasterrcnn_r50_fpn
 
 # ========== 可自行修改的設定 ==========
 IMG_DIR     = "data/mini_test"                      # 要可視化的影像資料夾（小測試集/驗證集/任一資料夾）
-CKPT_PATH   = "experiments/logs/fasterrcnn_r50fpn_final_v2.pth"  # 權重
+CKPT_PATH   = "experiments/logs/fasterrcnn_v5/fasterrcnn_v5.pth"  # 權重
 OUT_DIR     = "experiments/vis_pred"              # 輸出的圖片資料夾
 MAX_SIDE    = 1024                                  # 推論時最長邊縮放（保持等比）
 SCORE_THR   = 0.8                                 # 顯示框的分數門檻
