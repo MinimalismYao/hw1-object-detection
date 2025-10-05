@@ -1,162 +1,175 @@
-# src/modelv5.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+trainv5.py — Faster R-CNN ResNet50-FPN (from scratch)
+版本 v5：對應 modelv5 + YAML 參數化。
+"""
+
+import os, time, math, traceback, sys
+from pathlib import Path
+from contextlib import nullcontext
+
 import torch
-import torch.nn as nn
-import torchvision
-from typing import Any, Dict, Iterable, Optional
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
-from torchvision.models.detection import FasterRCNN
-from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
-from torchvision.models.detection.rpn import AnchorGenerator
-from torchvision.ops import MultiScaleRoIAlign
-from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
+from dataset import PigsDataset, collate_fn
+from transforms import get_transforms
+from modelv5 import get_fasterrcnn_r50_fpn
+from config import load_cfg
 
-# -------------------------- utils --------------------------
-def _as_tuple_sizes(sizes_like):
-    """
-    將多種寫法轉成 AnchorGenerator 需要的格式：
-      A) [[8], [16], [32], [64], [128]]
-      B) [8, 16, 32, 64, 128]
-      C) 8
-    皆會轉成：((8,), (16,), (32,), (64,), (128,))
-    """
-    if sizes_like is None:
-        return None
-    if isinstance(sizes_like, (int, float)):  # C
-        return ((int(sizes_like),),)
-    if isinstance(sizes_like, (list, tuple)) and all(isinstance(x, (int, float)) for x in sizes_like):  # B
-        return tuple((int(x),) for x in sizes_like)
-    if isinstance(sizes_like, (list, tuple)):  # A or mixed
+
+# ---------------- 小工具 ----------------
+class SmoothedValue:
+    def __init__(self, alpha=0.9):
+        self.alpha = alpha
+        self.avg = None
+    def update(self, v: float):
+        self.avg = v if self.avg is None else self.alpha * self.avg + (1 - self.alpha) * v
+    def value(self): return float("nan") if self.avg is None else float(self.avg)
+
+
+class EarlyStopping:
+    def __init__(self, mode="min", patience=5):
+        assert mode in ("min", "max")
+        self.mode, self.patience = mode, patience
+        self.best, self.wait, self.should_stop = None, 0, False
+    def step(self, value: float):
+        if self.best is None:
+            self.best = value; return True
+        improved = (value < self.best) if self.mode == "min" else (value > self.best)
+        if improved:
+            self.best, self.wait = value, 0
+            return True
+        self.wait += 1
+        if self.wait >= self.patience:
+            self.should_stop = True
+        return False
+
+
+class WarmupCosineLR(torch.optim.lr_scheduler._LRScheduler):
+    def __init__(self, optimizer, warmup_iters, total_iters, eta_min=0.0, last_epoch=-1):
+        self.warmup_iters = max(1, int(warmup_iters))
+        self.total_iters  = max(self.warmup_iters + 1, int(total_iters))
+        self.eta_min = float(eta_min)
+        super().__init__(optimizer, last_epoch)
+    def get_lr(self):
+        step = self.last_epoch + 1
         out = []
-        for s in sizes_like:
-            if isinstance(s, (list, tuple)):
-                if len(s) == 0:
-                    continue
-                out.append(tuple(int(v) for v in s))
+        for base_lr in self.base_lrs:
+            if step <= self.warmup_iters:
+                lr = base_lr * step / self.warmup_iters
             else:
-                out.append((int(s),))
-        return tuple(out)
-    raise TypeError(f"Unsupported type for rpn_anchor_sizes: {type(sizes_like)}")
+                t = (step - self.warmup_iters) / (self.total_iters - self.warmup_iters)
+                lr = self.eta_min + 0.5 * (base_lr - self.eta_min) * (1 + math.cos(math.pi * t))
+            out.append(lr)
+        return out
 
-def _maybe_get(d: Dict[str, Any], path: str, default=None):
-    cur = d
-    for k in path.split("."):
-        if not isinstance(cur, dict) or k not in cur:
-            return default
-        cur = cur[k]
-    return cur
 
-# --------------------- builder ---------------------
-def get_fasterrcnn_r50_fpn(
-    num_classes: int = 2,
-    freeze_backbone: bool = False,
-    *,
-    # Transform / inference 參數
-    min_size: Optional[int] = None,
-    max_size: Optional[int] = None,
-    image_mean: Iterable[float] = (0.0, 0.0, 0.0),
-    image_std: Iterable[float] = (1.0, 1.0, 1.0),
-    # Anchors / RPN / ROI
-    rpn_anchor_sizes: Optional[Iterable] = None,
-    rpn_anchor_ratios: Iterable[float] = (0.5, 1.0, 2.0),
-    rpn_pre_nms_top_n_train: int = 2000,
-    rpn_pre_nms_top_n_test: int = 1000,
-    rpn_post_nms_top_n_train: int = 1000,
-    rpn_post_nms_top_n_test: int = 1000,
-    rpn_nms_thresh: float = 0.7,
-    box_score_thresh: float = 0.05,
-    box_nms_thresh: float = 0.5,
-    box_detections_per_img: int = 100,
-    pretrained_backbone: bool = False,
-    cfg: Optional[Dict[str, Any]] = None,
-) -> FasterRCNN:
-    """
-    Faster R-CNN (ResNet50-FPN)
-    - 使用 torchvision 官方 resnet_fpn_backbone（相容性最佳）
-    - 支援從 cfg 覆蓋所有關鍵參數
-    """
-    # ---- 1) 從 cfg 取值（若存在） ----
-    acfg = _maybe_get(cfg or {}, "augment", {}) if cfg else {}
-    # Transform 尺寸：若沒指定，沿用 augment.max_side；否則 fallback 1024
-    min_size = _maybe_get(cfg or {}, "model.min_size", min_size)
-    max_size = _maybe_get(cfg or {}, "model.max_size", max_size)
-    if min_size is None and acfg:
-        min_size = int(acfg.get("max_side", 1024))
-    if max_size is None and acfg:
-        max_size = int(acfg.get("max_side", 1024))
-    if min_size is None: min_size = 1024
-    if max_size is None: max_size = 1024
+# ---------------- Sanity Check ----------------
+def quick_sanity_check(model, device, cfg):
+    ds = PigsDataset(cfg["data"]["train_img_dir"], cfg["data"]["train_gt"],
+                     transforms=get_transforms(train=True, max_side=cfg["sanity_check"]["max_side"]))
+    loader = DataLoader(ds, batch_size=1, shuffle=True, num_workers=0, collate_fn=collate_fn)
+    model.train()
+    images, targets = next(iter(loader))
+    images  = [images[0].to(device)]
+    targets = [{k: v.to(device) for k, v in targets[0].items()}]
+    loss = sum(model(images, targets).values())
+    print(f"[Sanity] one-step OK, loss={loss.item():.4f}")
 
-    # Anchors
-    rpn_anchor_sizes = _maybe_get(cfg or {}, "model.rpn_anchor_sizes", rpn_anchor_sizes)
-    sizes_tuple = _as_tuple_sizes(rpn_anchor_sizes) if rpn_anchor_sizes is not None else ((32,), (64,), (128,), (256,), (512,))
-    rpn_anchor_ratios = _maybe_get(cfg or {}, "model.rpn_anchor_ratios", list(rpn_anchor_ratios))
 
-    # RPN / ROI / Inference
-    rpn_pre_nms_top_n_train = int(_maybe_get(cfg or {}, "model.rpn_pre_nms_top_n_train", rpn_pre_nms_top_n_train))
-    rpn_post_nms_top_n_train = int(_maybe_get(cfg or {}, "model.rpn_post_nms_top_n_train", rpn_post_nms_top_n_train))
-    rpn_pre_nms_top_n_test  = int(_maybe_get(cfg or {}, "model.rpn_pre_nms_top_n_test",  rpn_pre_nms_top_n_test))
-    rpn_post_nms_top_n_test = int(_maybe_get(cfg or {}, "model.rpn_post_nms_top_n_test", rpn_post_nms_top_n_test))
-    rpn_nms_thresh = float(_maybe_get(cfg or {}, "model.rpn_nms_thresh", rpn_nms_thresh))
+# ---------------- Train / Val ----------------
+def train_one_epoch(model, loader, optimizer, device, epoch_idx, total_epochs,
+                    grad_clip=10.0, amp=False, scaler=None, scheduler_iter=None):
+    model.train()
+    total_loss, n = 0.0, 0
+    autocast_ctx = torch.amp.autocast("cuda") if amp else nullcontext()
 
-    box_score_thresh = float(_maybe_get(cfg or {}, "model.box_score_thresh", box_score_thresh))
-    box_nms_thresh   = float(_maybe_get(cfg or {}, "model.box_nms_thresh",   box_nms_thresh))
-    box_detections_per_img = int(_maybe_get(cfg or {}, "model.box_detections_per_img", box_detections_per_img))
+    pbar = tqdm(loader, total=len(loader), ncols=120, desc=f"Epoch {epoch_idx+1}/{total_epochs}")
+    for images, targets in pbar:
+        images  = [img.to(device) for img in images]
+        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        with autocast_ctx:
+            loss_dict = model(images, targets)
+            loss = sum(loss_dict.values())
+        optimizer.zero_grad(set_to_none=True)
+        if amp and scaler is not None:
+            scaler.scale(loss).backward()
+            if grad_clip:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(optimizer); scaler.update()
+        else:
+            loss.backward()
+            if grad_clip:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+        if scheduler_iter is not None:
+            scheduler_iter.step()
+        total_loss += float(loss.item()); n += 1
+        pbar.set_postfix({"loss": f"{total_loss/n:.3f}", "lr": f"{optimizer.param_groups[0]['lr']:.2e}"})
+        del loss_dict, loss, images, targets
+    return total_loss / max(1, n)
 
-    pretrained_backbone = bool(_maybe_get(cfg or {}, "model.pretrained_backbone", pretrained_backbone))
-    freeze_backbone     = bool(_maybe_get(cfg or {}, "model.freeze_backbone", freeze_backbone))
 
-    # ---- 2) Backbone with FPN（官方工具，避免 __init__ 相容性問題）----
-    #   - weights=None：不載入預訓練（from scratch）
-    #   - norm_layer=BatchNorm2d：可學 BN
-    #   - trainable_layers=5：全開可訓練（若 freeze_backbone=True 再凍結）
-    backbone = resnet_fpn_backbone(
-        backbone_name="resnet50",
-        weights=None if not pretrained_backbone else torchvision.models.ResNet50_Weights.DEFAULT if hasattr(torchvision.models, "ResNet50_Weights") else "IMAGENET1K_V1",
-        trainable_layers=5,
-        norm_layer=nn.BatchNorm2d,
-    )
+@torch.no_grad()
+def validate_one_epoch(model, loader, device, amp=False):
+    model.train()
+    total, n = 0.0, 0
+    autocast_ctx = torch.amp.autocast("cuda") if amp else nullcontext()
+    for images, targets in loader:
+        images  = [img.to(device) for img in images]
+        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        with autocast_ctx:
+            loss = sum(model(images, targets).values())
+        total += float(loss.item()); n += 1
+    return total / max(1, n)
 
-    # ---- 3) Anchors / RoIAlign ----
-    anchor_generator = AnchorGenerator(
-        sizes=sizes_tuple,
-        aspect_ratios=(tuple(float(r) for r in rpn_anchor_ratios),) * len(sizes_tuple),
-    )
-    roi_pooler = MultiScaleRoIAlign(
-        featmap_names=["0", "1", "2", "3"],   # FPN P2~P5
-        output_size=7,
-        sampling_ratio=2,
-    )
 
-    # ---- 4) FasterRCNN 主體 ----
-    model = FasterRCNN(
-        backbone=backbone,
-        num_classes=num_classes,  # 背景+1類 = 2
-        rpn_anchor_generator=anchor_generator,
-        box_roi_pool=roi_pooler,
-        # GeneralizedRCNNTransform
-        min_size=int(min_size),
-        max_size=int(max_size),
-        image_mean=list(image_mean),
-        image_std=list(image_std),
-        # RPN
-        rpn_pre_nms_top_n_train=int(rpn_pre_nms_top_n_train),
-        rpn_pre_nms_top_n_test=int(rpn_pre_nms_top_n_test),
-        rpn_post_nms_top_n_train=int(rpn_post_nms_top_n_train),
-        rpn_post_nms_top_n_test=int(rpn_post_nms_top_n_test),
-        rpn_nms_thresh=float(rpn_nms_thresh),
-        # ROI / Inference
-        box_score_thresh=float(box_score_thresh),
-        box_nms_thresh=float(box_nms_thresh),
-        box_detections_per_img=int(box_detections_per_img),
-    )
+# ---------------- Main ----------------
+def main():
+    print("[DBG] Enter main()")
+    project_root = Path(__file__).resolve().parents[1]
+    cfg_path = project_root / "experiments/configs/v5.yaml"
+    print(f"[DBG] CFG_PATH={cfg_path} -> exists={cfg_path.exists()}")
+    cfg = load_cfg(str(cfg_path))
 
-    # ---- 5) 凍結 backbone（如需）----
-    if freeze_backbone:
-        for p in model.backbone.parameters():
-            p.requires_grad_(False)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[Device] {device}")
 
-    # ---- 6) 保險：替換分類頭以確保 num_classes 正確 ----
-    in_features = model.roi_heads.box_predictor.cls_score.in_features
-    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+    model = get_fasterrcnn_r50_fpn(
+        num_classes=cfg["model"]["num_classes"],
+        freeze_backbone=cfg["model"]["freeze_backbone"]
+    ).to(device)
+    print("[DBG] model built OK")
 
-    return model
+    if cfg["sanity_check"]["enabled"]:
+        quick_sanity_check(model, device, cfg)
+
+    ds = PigsDataset(cfg["data"]["train_img_dir"], cfg["data"]["train_gt"],
+                     transforms=get_transforms(train=True, max_side=cfg["augment"]["max_side"]))
+    loader = DataLoader(ds, batch_size=cfg["train"]["batch_size"],
+                        shuffle=True, num_workers=cfg["data"]["num_workers"], collate_fn=collate_fn)
+    print(f"[Data] train samples={len(ds)}")
+
+    optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad],
+                                lr=cfg["optimizer"]["lr"], momentum=cfg["optimizer"]["momentum"])
+    print(f"[Train] epochs={cfg['train']['epochs']}, batch={cfg['train']['batch_size']}")
+
+    for epoch in range(cfg["train"]["epochs"]):
+        avg_loss = train_one_epoch(model, loader, optimizer, device, epoch, cfg["train"]["epochs"])
+        print(f"[Epoch {epoch+1}] loss={avg_loss:.4f}")
+
+    out = Path(cfg["checkpoint"]["save_full_path"])
+    torch.save(model.state_dict(), out)
+    print(f"[Save] {out}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        print("\n[DBG] Uncaught exception!\n", file=sys.stderr)
+        traceback.print_exc()
+        raise
