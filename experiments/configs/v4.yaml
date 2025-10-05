@@ -1,5 +1,5 @@
-# ===== 顶層必要鍵（供現版 train.py 使用） =====
-seed: 42                     # ★新增：train.py 讀的是頂層 seed
+# ===== 頂層必要鍵（供現版 train.py 使用） =====
+seed: 42                     # train.py 會優先讀這個
 
 project:
   name: hw1_od
@@ -10,22 +10,22 @@ project:
 
 data:
   root: data
-  train_img_dir: ${data.root}/train/img
-  train_gt: ${data.root}/train/gt.txt
-  val_img_dir: ${data.root}/val/img
-  val_gt: ${data.root}/val/gt_val.txt
-  test_img_dir: ${data.root}/test/img
+  train_img_dir: data/train/img
+  train_gt: data/train/gt.txt
+  val_img_dir: data/val/img
+  val_gt: data/val/gt_val.txt
+  test_img_dir: data/test/img
   num_workers: 16
 
 model:
-  detector: fasterrcnn_r50_fpn   # 保留給其他腳本
-  backbone: resnet50             # ★新增：train.py 需要的鍵
-  num_classes: 1                 # ★修正：單類別任務 → 1（train.py 會自動 + 背景）
+  detector: fasterrcnn_r50_fpn
+  backbone: resnet50
+  num_classes: 1               # 單類別任務（train.py 會自動 + 背景）
   freeze_backbone: false
   pretrained: false
 
 augment:
-  max_side: 1024
+  max_side: 800
   resize: null
   flip_p: 0.5
   hsv: false
@@ -35,8 +35,9 @@ train:
   epochs: 30
   batch_size: 8
   grad_clip: 10.0
-  amp: false
+  amp: true
   cudnn_benchmark: true
+  accumulate: 1               # 可累積梯度（預設 1 即不累積）
 
 optimizer:
   type: sgd
@@ -51,8 +52,8 @@ scheduler:
 
 dataloader:
   pin_memory: true
-  persistent_workers: true
-  prefetch_factor: 4
+  persistent_workers: false
+  prefetch_factor: 2
   shuffle: true
 
 sanity_check:

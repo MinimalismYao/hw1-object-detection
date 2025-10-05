@@ -1,248 +1,230 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+src/train.py
+Faster R-CNN + ResNet50-FPN 訓練腳本（檔頭可調參數版）。
+- 在檔頭選擇 YAML、列出覆寫鍵值（不需要命令列參數）
+- 保留：tqdm、Sanity Check、StepLR、Gradient Clipping、只存最後權重
+- 預設讀取 experiments/configs/default.yaml
+"""
 
-# =========================
-# 直接在這裡指定要用的 YAML
-# =========================
-CONFIG_PATH = "experiments/configs/v4.yaml"   # ← 改這行即可切換設定
+# ========= 可在這裡快速調整的區域（只改這塊就好） =========
+# 指定要讀的 YAML 設定檔（相對於專案根目錄）
+CFG_PATH = "experiments/configs/default.yaml"
+
+# 需要臨時覆寫的設定（採用 dot-notation），例：
+#   "train.epochs=40", "optimizer.lr=0.001", "model.freeze_backbone=true"
+OVERRIDES = [
+    # "train.epochs=2",
+    # "optimizer.lr=0.003",
+    # "augment.max_side=1024",
+    # "checkpoint.name=fasterrcnn_r50fpn_final_v3.pth",
+]
+
+# 若你想強制跳過或啟用 sanity check，可在此覆寫（None = 依 YAML）
+SANITY_CHECK_FORCE = None  # 可選：True / False / None
+# =======================================================
+
 
 import os
-import math
 import time
-import random
 from pathlib import Path
-from typing import Dict, Any
-
-import yaml
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
-# 專案內部（依你現有檔案）
 from dataset import PigsDataset, collate_fn
 from transforms import get_transforms
-
-# 使用 torchvision 內建的 Faster R-CNN（不改 anchors，避免維度不符）
-import torchvision
-from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from model import get_fasterrcnn_r50_fpn
+from config import load_cfg  # 位於 src/config.py
 
 
-# -------------------------
-# 工具
-# -------------------------
-def load_cfg(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+# ---- 小工具：平滑顯示 ----
+class SmoothedValue:
+    def __init__(self, alpha=0.9):
+        self.alpha = alpha
+        self.avg = None
+    def update(self, v: float):
+        self.avg = v if self.avg is None else self.alpha * self.avg + (1 - self.alpha) * v
+    def value(self):
+        return float("nan") if self.avg is None else float(self.avg)
 
 
-def set_seed(seed: int = 42):
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
-class EarlyStopping:
-    def __init__(self, mode: str = "min", patience: int = 5):
-        assert mode in ("min", "max")
-        self.mode = mode
-        self.patience = patience
-        self.best = None
-        self.wait = 0
-        self.should_stop = False
-
-    def step(self, value: float) -> bool:
-        if self.best is None:
-            self.best = value
-            self.wait = 0
-            return True
-        improved = (value < self.best) if self.mode == "min" else (value > self.best)
-        if improved:
-            self.best = value
-            self.wait = 0
-            return True
-        self.wait += 1
-        if self.wait >= self.patience:
-            self.should_stop = True
-        return False
-
-
-# -------------------------
-# 建立模型（用預設 anchors，避免維度錯誤）
-# -------------------------
-def build_model(cfg: Dict[str, Any]) -> nn.Module:
-    num_classes = int(cfg.get("model", {}).get("num_classes", 1)) + 1  # 含背景
-    backbone = str(cfg.get("model", {}).get("backbone", "resnet50")).lower()
-
-    if backbone == "resnet50":
-        model = torchvision.models.detection.fasterrcnn_resnet50_fpn(
-            weights=None,              # 作業常規不允許外部預訓練
-            weights_backbone=None      # 不載入 backbone 預訓練
-        )
-    else:
-        raise ValueError(f"Unsupported backbone: {backbone}")
-
-    # 替換分類頭（確保類別數）
-    in_features = model.roi_heads.box_predictor.cls_score.in_features
-    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
-
-    # （不覆寫 model.rpn.anchor_generator、不改 rpn 參數 → 避免 decode 堆疊維度不符）
-    return model
-
-
-# -------------------------
-# 訓練 / 驗證（簡潔版）
-# -------------------------
-def train_one_epoch(model, loader, optimizer, device, epoch_idx, total_epochs) -> float:
+def train_one_epoch(model, loader, optimizer, device, epoch_idx, total_epochs, grad_clip=10.0):
     model.train()
-    total_loss, n = 0.0, 0
-    optimizer.zero_grad(set_to_none=True)
+    total_loss, num_batches = 0.0, 0
 
-    for images, targets in loader:
+    s_total  = SmoothedValue(0.9)
+    s_rpnobj = SmoothedValue(0.9)
+    s_rpnreg = SmoothedValue(0.9)
+    s_cls    = SmoothedValue(0.9)
+    s_box    = SmoothedValue(0.9)
+
+    epoch_t0 = time.perf_counter()
+    pbar = tqdm(loader, total=len(loader), ncols=120, desc=f"Epoch {epoch_idx+1}/{total_epochs}")
+
+    for step, (images, targets) in enumerate(pbar, start=1):
+        bt0 = time.perf_counter()
+
         images  = [img.to(device) for img in images]
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-        loss_dict = model(images, targets)
+        loss_dict = model(images, targets)  # dict: loss_classifier, loss_box_reg, loss_objectness, loss_rpn_box_reg
+
+        # 防呆：略過非有限值
+        if any(not torch.isfinite(val) for val in loss_dict.values()):
+            print("[Warn] Non-finite loss dict, skip this batch.")
+            continue
         loss = sum(loss_dict.values())
+        if not torch.isfinite(loss):
+            print("[Warn] total loss is NaN/Inf, skip this batch.")
+            continue
 
+        optimizer.zero_grad()
         loss.backward()
+        if grad_clip and grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in model.parameters() if p.requires_grad], max_norm=grad_clip
+            )
         optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
 
-        total_loss += loss.item()
-        n += 1
+        l_total = float(loss.item())
+        total_loss += l_total
+        num_batches += 1
 
-    avg = total_loss / max(1, n)
-    print(f"[Train] epoch {epoch_idx+1}/{total_epochs} loss={avg:.4f}")
-    return avg
+        # 分項（容錯 key）
+        l_obj = float(loss_dict.get("loss_objectness",   torch.tensor(0.0)).item())
+        l_rpn = float(loss_dict.get("loss_rpn_box_reg",  torch.tensor(0.0)).item())
+        l_cls = float(loss_dict.get("loss_classifier",   torch.tensor(0.0)).item())
+        l_box = float(loss_dict.get("loss_box_reg",      torch.tensor(0.0)).item())
+
+        s_total.update(l_total)
+        s_rpnobj.update(l_obj)
+        s_rpnreg.update(l_rpn)
+        s_cls.update(l_cls)
+        s_box.update(l_box)
+
+        bt = time.perf_counter() - bt0
+        lr = optimizer.param_groups[0]["lr"]
+        pbar.set_postfix({
+            "loss":    f"{s_total.value():.3f}",
+            "rpn_obj": f"{s_rpnobj.value():.3f}",
+            "rpn_reg": f"{s_rpnreg.value():.3f}",
+            "cls":     f"{s_cls.value():.3f}",
+            "box":     f"{s_box.value():.3f}",
+            "bt":      f"{bt*1000:.0f}ms",
+            "lr":      f"{lr:.3e}",
+        })
+
+    epoch_time = time.perf_counter() - epoch_t0
+    avg_loss = total_loss / max(1, num_batches)
+    print(f"[Epoch {epoch_idx+1}/{total_epochs}] avg_loss={avg_loss:.4f} | time={epoch_time:.1f}s")
+    return avg_loss, epoch_time
 
 
-@torch.no_grad()
-def validate_one_epoch(model, loader, device) -> float:
-    """
-    torchvision 的 Faster R-CNN 在 eval() 下 forward(images) 回預測、沒有 loss。
-    這裡用 train() + no_grad() 的技巧計 loss（不會更新參數/統計）。
-    """
+def quick_sanity_check(model, device, cfg):
+    """ batch_size=1 快測 forward/backward 是否能跑通 """
+    ds = PigsDataset(cfg["data"]["train_img_dir"], cfg["data"]["train_gt"],
+                     transforms=get_transforms(train=True, max_side=cfg["sanity_check"]["max_side"]))
+    loader = DataLoader(
+        ds, batch_size=cfg["sanity_check"]["batch_size"], shuffle=True,
+        num_workers=cfg["data"]["num_workers"], pin_memory=True,
+        persistent_workers=True, prefetch_factor=4, collate_fn=collate_fn
+    )
     model.train()
-    total, n = 0.0, 0
-    for images, targets in loader:
-        images  = [img.to(device) for img in images]
-        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-        loss_dict = model(images, targets)
-        total += sum(loss_dict.values()).item()
-        n += 1
-    return total / max(1, n)
+    params = [p for p in model.parameters() if p.requires_grad]
+    optim = torch.optim.SGD(params, lr=0.01, momentum=0.9)
+    images, targets = next(iter(loader))
+    images  = [images[0].to(device)]
+    targets = [{k: v.to(device) for k, v in targets[0].items()}]
+    loss = sum(model(images, targets).values())
+    optim.zero_grad()
+    loss.backward()
+    optim.step()
+    print(f"[Sanity] one-step OK, loss={loss.item():.4f}")
 
 
-# -------------------------
-# Main
-# -------------------------
 def main():
-    cfg = load_cfg(CONFIG_PATH)
+    # 以 train.py 的位置推回到專案根目錄，再拼 config 路徑
+    project_root = Path(__file__).resolve().parents[1]
+    cfg_file = project_root / CFG_PATH
 
-    # 基本設定
-    seed = int(cfg.get("seed", 42))
-    set_seed(seed)
+    # 讀設定（支援檔頭 OVERRIDES）
+    cfg = load_cfg(str(cfg_file), overrides=OVERRIDES)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[Device] {device}")
+    # （可選）強制覆寫 sanity_check 開關
+    if SANITY_CHECK_FORCE is not None:
+        cfg["sanity_check"]["enabled"] = bool(SANITY_CHECK_FORCE)
 
-    # I/O
-    ckpt_dir = Path(cfg.get("checkpoint", {}).get("dir", "experiments/logs"))
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    last_name = cfg.get("checkpoint", {}).get("name", "last.pth")
-    best_name = cfg.get("early_stop", {}).get("best_name", "best.pth")
-    last_path = ckpt_dir / last_name
-    best_path = ckpt_dir / best_name
+    device = torch.device("cuda" if torch.cuda.is_available() and cfg["device"]["cuda"] else "cpu")
+    torch.backends.cudnn.benchmark = cfg["train"]["cudnn_benchmark"]
 
-    # Data（沿用你的 dataset/transforms）
-    aug_max_side = int(cfg.get("augment", {}).get("max_side", 1024))
+    # === 建模 ===
+    model = get_fasterrcnn_r50_fpn(
+        num_classes=cfg["model"]["num_classes"],
+        freeze_backbone=cfg["model"]["freeze_backbone"]
+    ).to(device)
+
+    # === Sanity Check ===
+    if cfg["sanity_check"]["enabled"]:
+        quick_sanity_check(model, device, cfg)
+
+    # === 資料 ===
     train_ds = PigsDataset(
         cfg["data"]["train_img_dir"],
         cfg["data"]["train_gt"],
-        transforms=get_transforms(train=True, max_side=aug_max_side),
+        transforms=get_transforms(train=True, max_side=cfg["augment"]["max_side"])
     )
     train_loader = DataLoader(
         train_ds,
-        batch_size=int(cfg.get("train", {}).get("batch_size", 8)),
+        batch_size=cfg["train"]["batch_size"],
         shuffle=True,
-        num_workers=int(cfg.get("data", {}).get("num_workers", 4)),
-        pin_memory=bool(cfg.get("dataloader", {}).get("pin_memory", True)),
-        collate_fn=collate_fn,
+        num_workers=cfg["data"]["num_workers"],
+        pin_memory=cfg["dataloader"]["pin_memory"],
+        persistent_workers=cfg["dataloader"]["persistent_workers"],
+        prefetch_factor=cfg["dataloader"]["prefetch_factor"],
+        collate_fn=collate_fn
     )
 
-    val_loader = None
-    val_img_dir = cfg.get("data", {}).get("val_img_dir", "")
-    val_gt = cfg.get("data", {}).get("val_gt", "")
-    if val_img_dir and val_gt and os.path.isdir(val_img_dir) and os.path.exists(val_gt):
-        val_ds = PigsDataset(
-            val_img_dir,
-            val_gt,
-            transforms=get_transforms(train=False, max_side=aug_max_side),
+    # === 優化器與學習率排程 ===
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.SGD(
+        params,
+        lr=cfg["optimizer"]["lr"],
+        momentum=cfg["optimizer"]["momentum"],
+        weight_decay=cfg["optimizer"]["weight_decay"]
+    )
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer,
+        step_size=cfg["scheduler"]["step_size"],
+        gamma=cfg["scheduler"]["gamma"]
+    )
+
+    # === 訓練 ===
+    os.makedirs(cfg["checkpoint"]["dir"], exist_ok=True)
+    total_t0 = time.perf_counter()
+    for epoch in range(cfg["train"]["epochs"]):
+        avg_loss, epoch_time = train_one_epoch(
+            model, train_loader, optimizer, device,
+            epoch_idx=epoch, total_epochs=cfg["train"]["epochs"],
+            grad_clip=cfg["train"]["grad_clip"]
         )
-        val_loader = DataLoader(
-            val_ds,
-            batch_size=int(cfg.get("train", {}).get("batch_size", 8)),
-            shuffle=False,
-            num_workers=int(cfg.get("data", {}).get("num_workers", 4)),
-            pin_memory=bool(cfg.get("dataloader", {}).get("pin_memory", True)),
-            collate_fn=collate_fn,
-        )
-        print(f"[Data] val set enabled: {len(val_ds)} samples")
-    else:
-        print("[Data] no validation set configured; will monitor train loss for early stopping")
+        scheduler.step()
+    total_time = time.perf_counter() - total_t0
 
-    # Model / Optimizer（極簡）
-    model = build_model(cfg).to(device)
+    # === 保存（只存最後一個） ===
+    ckpt_cfg  = cfg["checkpoint"]
+    ckpt_path = ckpt_cfg.get("save_full_path") or os.path.join(ckpt_cfg["dir"], ckpt_cfg["name"])
+    os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
 
-    opt_name = str(cfg.get("optimizer", {}).get("type", "sgd")).lower()
-    lr = float(cfg.get("optimizer", {}).get("lr", 0.0025))
-    weight_decay = float(cfg.get("optimizer", {}).get("weight_decay", 1e-4))
-    if opt_name == "adamw":
-        optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=lr, weight_decay=weight_decay)
-    else:
-        momentum = float(cfg.get("optimizer", {}).get("momentum", 0.9))
-        optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=lr, momentum=momentum, weight_decay=weight_decay)
+    state = model.state_dict()
+    if ckpt_cfg.get("save_fp16", False):
+        # 可選：半精度存檔，檔案大約減半
+        state = {k: v.half() for k, v in state.items()}
 
-    epochs = int(cfg.get("train", {}).get("epochs", 30))
-    print(f"[Train] epochs={epochs}, batch_size={cfg.get('train',{}).get('batch_size',8)}")
+    torch.save(state, ckpt_path)
+    print(f"[Save Final] {ckpt_path}")
 
-    # Early Stopping（預設開啟，patience=5）
-    es_cfg = cfg.get("early_stop", {})
-    use_es = bool(es_cfg.get("enabled", True))
-    patience = int(es_cfg.get("patience", 5))
-    es = EarlyStopping(mode=str(es_cfg.get("mode", "min")), patience=patience) if use_es else None
-
-    # Loop
-    t0 = time.perf_counter()
-    for epoch in range(epochs):
-        train_loss = train_one_epoch(model, train_loader, optimizer, device, epoch, epochs)
-
-        if val_loader is not None:
-            val_loss = validate_one_epoch(model, val_loader, device)
-            print(f"[Val]  epoch {epoch+1}/{epochs} val_loss={val_loss:.4f}")
-            monitored = val_loss
-        else:
-            monitored = train_loss
-
-        # 早停 + 存最佳
-        if use_es:
-            improved = es.step(monitored)
-            if improved:
-                torch.save(model.state_dict(), best_path.as_posix())
-                print(f"[EarlyStop] New best ({monitored:.4f}). Saved -> {best_path}")
-            if es.should_stop:
-                print(f"[EarlyStop] No improvement in {patience} epochs. Stop at epoch {epoch+1}.")
-                break
-
-    print(f"[Done] total_time={(time.perf_counter()-t0)/60:.2f} min")
-
-    # 存最後
-    torch.save(model.state_dict(), last_path.as_posix())
-    print(f"[Save Last] {last_path}")
-    if use_es and best_path.exists():
-        print(f"[Best Model] {best_path}")
 
 
 if __name__ == "__main__":
