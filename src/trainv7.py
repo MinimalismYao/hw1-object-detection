@@ -4,10 +4,12 @@
 trainv6.py — YAML-driven detector training (no pretrained weights)
 對應：modelv6.py、transforms.py、experiments/configs/v6.yaml
 
-重點更新：
-1) 改為由 YAML 的 model.detector 建模（透過 modelv6.build_detector_from_cfg）
-   - 可選：fasterrcnn_r50_fpn / fasterrcnn_mbv3_fpn / fasterrcnn_r101_fpn / retinanet_r50_fpn / ssdlite_mbv3
-2) 其餘流程（資料管線、AMP、early-stop、accumulate、StepLR）保持不變
+更新重點：
+1) 由 YAML 的 model.detector 建模（透過 modelv6.build_detector_from_cfg）
+2) 訓練完成後，自動整合 eval.py 執行驗證（可用 eval.run_after_train 開啟/關閉）
+   - 使用與訓練同一份 YAML
+   - 直接指定剛剛輸出的 checkpoint（best 優先，否則 last）
+   - 讓 eval 也走「模型工廠」，不同 detector 自動對齊
 """
 
 import os, time, math, traceback, sys, random
@@ -22,7 +24,6 @@ from tqdm import tqdm
 
 from dataset import PigsDataset, collate_fn
 from transforms import get_transforms
-# from modelv6 import get_fasterrcnn_r50_fpn
 from modelv6 import build_detector_from_cfg  # ← 改用模型工廠
 from omegaconf import OmegaConf
 from config import load_cfg
@@ -87,7 +88,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch_idx, total_epochs,
             loss_dict = model(images, targets)
             loss = sum(loss_dict.values())
 
-        loss_scaled = loss / accumulate
+        loss_scaled = loss / max(1, accumulate)
         if amp and scaler is not None:
             scaler.scale(loss_scaled).backward()
         else:
@@ -144,10 +145,8 @@ def main():
         if OmegaConf.is_config(cfg_raw):
             cfg = OmegaConf.to_container(cfg_raw, resolve=True)
         else:
-            # 將普通 dict 包成 OmegaConf，再做變數展開（支援 ${...}）
             cfg = OmegaConf.to_container(OmegaConf.create(cfg_raw), resolve=True)
     except Exception:
-        # 保底：就用原始 dict（不展開 ${...}），但不建議
         print("[WARN] OmegaConf resolve 失敗，改用原始 cfg（${...} 不會被展開）")
         cfg = cfg_raw
 
@@ -173,17 +172,17 @@ def main():
         train=True,
         max_side=cfg["augment"]["max_side"],
         flip_p=cfg["augment"]["flip_p"],
-        hsv=cfg["augment"]["hsv"],                       # ← 改為可傳 [h,s,v]
+        hsv=cfg["augment"]["hsv"],
         resize=cfg["augment"]["resize"],
         mosaic=cfg["augment"]["mosaic"],
-        min_box_size=float(cfg["data"]["min_box_wh"][0]),# ← 接 data.min_box_wh
+        min_box_size=float(cfg["data"]["min_box_wh"][0]),
         color_jitter_prob=cfg["augment"]["color_jitter_prob"],
-        color_jitter=cfg["augment"]["color_jitter"],     # ← [b,c,s,h]
+        color_jitter=cfg["augment"]["color_jitter"],
     )
     val_tfms = get_transforms(
         train=False,
         max_side=cfg["augment"]["max_side"],
-        min_box_size=float(cfg["data"]["min_box_wh"][0]),# ← 驗證集同樣門檻
+        min_box_size=float(cfg["data"]["min_box_wh"][0]),
     )
 
     ds_train = PigsDataset(cfg["data"]["train_img_dir"], cfg["data"]["train_gt"], transforms=train_tfms)
@@ -290,6 +289,40 @@ def main():
         save_path = ckpt_dir / save_name
         torch.save(model.state_dict(), save_path)
         print(f"[Save][epoch] {save_path}")
+
+    # 9) （新增）訓練後自動評估：整合 eval.py
+    run_eval_after = bool(cfg.get("eval", {}).get("run_after_train", True))
+    if run_eval_after:
+        try:
+            # 目標 checkpoint：若有 best 且設定存 best，就用 best；否則用 last
+            ckpt_use = ckpt_best if (es_savebest and ckpt_best.exists()) else ckpt_last
+            print(f"[Post-Eval] Using checkpoint: {ckpt_use}")
+
+            # 匯入 eval 作為模組，避免與內建 eval() 衝突
+            import importlib
+            eval_mod = importlib.import_module("eval")
+
+            # 讓 eval 也走「模型工廠」而不是寫死 R50-FPN：
+            # eval.py 內部會呼叫 get_fasterrcnn_r50_fpn(..., cfg=cfg)
+            # 我們把它 monkey-patch 成用 build_detector_from_cfg(cfg)
+            from modelv6 import build_detector_from_cfg as _factory_for_eval
+            def _patched_builder(**kwargs):
+                # kwargs 會帶 cfg
+                return _factory_for_eval(kwargs.get("cfg"))
+            setattr(eval_mod, "get_fasterrcnn_r50_fpn", _patched_builder)
+
+            # 指定 eval 讀同一份 YAML，並覆寫 checkpoint 路徑
+            # eval.py 會：cfg = load_cfg(project_root/CFG_PATH, overrides=OVERRIDES)
+            rel_cfg_path = str(cfg_path.relative_to(project_root))
+            setattr(eval_mod, "CFG_PATH", rel_cfg_path)
+            setattr(eval_mod, "OVERRIDES", [f"checkpoint.save_full_path={ckpt_use}"])
+
+            print("[Post-Eval] Running eval.main() ...")
+            eval_mod.main()  # 會印出 COCO 摘要，並寫 details/txt 到 cfg.eval.save_dir
+            print("[Post-Eval] Done.")
+        except Exception as e:
+            print(f"[Post-Eval][WARN] 自動評估失敗：{e}")
+            traceback.print_exc()
 
 
 if __name__ == "__main__":

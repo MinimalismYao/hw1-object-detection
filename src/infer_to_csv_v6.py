@@ -2,13 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 src/infer_to_csv.py  ·  Kaggle 提交保守穩妥版
-- Image_ID: 使用 enumerate 從 1 開始的整數（和你 0.17033 的那版一致）
+- 與訓練同一份 YAML（含 detector/anchors/尺寸/NMS）
+- Image_ID: 使用 enumerate 從 1 開始的整數（沿用你 0.17033 那版做法）
 - PredictionString: 一律輸出 6 欄位的倍數 => "conf x y w h class"（class 固定 0）
 """
 
 from pathlib import Path
 import csv
-from typing import List
+from typing import List, Tuple
 
 import torch
 import torchvision
@@ -18,17 +19,19 @@ from PIL import Image
 from tqdm import tqdm
 
 from config import load_cfg
-from modelv6 import get_fasterrcnn_r50_fpn
+from modelv6 import build_detector_from_cfg  # ← 改用可切換架構的工廠
 
 # ========= 覆寫設定（可留空） =========
 CFG_PATH = "experiments/configs/v6.yaml"
 OVERRIDES = [
-    "checkpoint.save_full_path=experiments/logs/fasterrcnn_v6/fasterrcnn_v6_best.pth",
+    # 指定要用的 checkpoint；若留空會用 YAML 的 checkpoint 配置
+    # "checkpoint.save_full_path=experiments/logs/fasterrcnn_v6/fasterrcnn_v6_best.pth",
     # "project.run_name=submit_v6",
 ]
 # ====================================
 
-def list_images_sorted(img_dir: str):
+
+def list_images_sorted(img_dir: str) -> list[Path]:
     p = Path(img_dir)
     files = [*p.glob("*.jpg"), *p.glob("*.jpeg"), *p.glob("*.png"), *p.glob("*.bmp"),
              *p.glob("*.JPG"), *p.glob("*.JPEG"), *p.glob("*.PNG"), *p.glob("*.BMP")]
@@ -37,7 +40,8 @@ def list_images_sorted(img_dir: str):
         return (0, int(stem)) if stem.isdigit() else (1, fp.stem)
     return sorted(files, key=_key)
 
-def resize_keep_max_side(img: Image.Image, max_side: int):
+
+def resize_keep_max_side(img: Image.Image, max_side: int) -> Tuple[Image.Image, float]:
     w, h = img.size
     m = max(w, h)
     if m <= max_side:
@@ -46,17 +50,20 @@ def resize_keep_max_side(img: Image.Image, max_side: int):
     new_w, new_h = int(round(w * s)), int(round(h * s))
     return img.resize((new_w, new_h), Image.BILINEAR), s
 
+
 def xyxy_to_xywh(boxes: torch.Tensor) -> torch.Tensor:
     xywh = boxes.clone()
     xywh[:, 2] = xywh[:, 2] - xywh[:, 0]
     xywh[:, 3] = xywh[:, 3] - xywh[:, 1]
     return xywh
 
+
 def _state_to_fp32(state):
     for k, v in list(state.items()):
         if isinstance(v, torch.Tensor) and v.is_floating_point() and v.dtype == torch.float16:
             state[k] = v.float()
     return state
+
 
 def soft_nms_gaussian(boxes, scores, iou_thresh, sigma, score_thresh) -> List[int]:
     boxes = boxes.clone().cpu()
@@ -76,6 +83,7 @@ def soft_nms_gaussian(boxes, scores, iou_thresh, sigma, score_thresh) -> List[in
         order.sort(key=lambda j: float(keep_scores[j]), reverse=True)
     kept.sort(key=lambda j: float(keep_scores[j]), reverse=True)
     return kept
+
 
 def soft_nms_linear_or_hard(boxes, scores, iou_thresh, method, score_thresh) -> List[int]:
     if method == "hard":
@@ -100,6 +108,7 @@ def soft_nms_linear_or_hard(boxes, scores, iou_thresh, method, score_thresh) -> 
     kept.sort(key=lambda j: float(keep_scores[j]), reverse=True)
     return kept
 
+
 @torch.inference_mode()
 def main():
     project_root = Path(__file__).resolve().parents[1]
@@ -115,13 +124,8 @@ def main():
     assert ckpt_path.exists(), f"找不到權重檔：{ckpt_path}"
     assert test_dir.exists(), "找不到測試影像資料夾"
 
-    # 模型（與訓練同 cfg）
-    model = get_fasterrcnn_r50_fpn(
-        num_classes=int(cfg["model"]["num_classes"]),
-        freeze_backbone=bool(cfg["model"]["freeze_backbone"]),
-        pretrained_backbone=bool(cfg["model"].get("pretrained_backbone", False)),
-        cfg=cfg,
-    ).to(device)
+    # ---- 模型（與訓練同 cfg；自動依 YAML 選 detector）----
+    model = build_detector_from_cfg(cfg).to(device)
     try:
         state = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
     except TypeError:
@@ -129,13 +133,14 @@ def main():
     model.load_state_dict(_state_to_fp32(state), strict=True)
     model.eval()
 
-    # 推論設定
+    # ---- 推論參數 ----
     score_thr = float(cfg["infer"]["score_thr"])
     nms_iou   = float(cfg["infer"]["nms_iou"])
     max_side  = int(cfg["augment"]["max_side"])
     max_det   = int(cfg.get("infer", {}).get("postproc", {}).get("topk_per_image",
                       int(cfg.get("eval", {}).get("max_det", 100))))
-    # 後處理
+
+    # ---- 後處理設定（沿用 YAML）----
     pp = cfg.get("infer", {}).get("postproc", {})
     soft_cfg = pp.get("soft_nms", {})
     use_soft = bool(soft_cfg.get("enabled", False))
@@ -174,16 +179,16 @@ def main():
             scores = out["scores"]
             labels = out["labels"]
 
-            # 只前景
+            # 只保留前景類別（1）
             keep = (labels == 1)
             boxes, scores = boxes[keep], scores[keep]
 
-            # 初步閾值
+            # 初步分數門檻
             if boxes.numel() > 0:
                 k0 = scores >= score_thr
                 boxes, scores = boxes[k0], scores[k0]
 
-            # (Soft-)NMS
+            # NMS / Soft-NMS
             if boxes.numel() > 0:
                 if use_soft:
                     if soft_method == "gaussian":
@@ -194,7 +199,7 @@ def main():
                     keep_idx = nms(boxes, scores, nms_iou).cpu().tolist()
                 boxes, scores = boxes[keep_idx], scores[keep_idx]
 
-            # 回到原圖、clip
+            # 還原到原圖座標並裁邊
             if boxes.numel() > 0 and scale != 1.0:
                 boxes = boxes / float(scale)
             if boxes.numel() > 0:
@@ -204,7 +209,7 @@ def main():
                 y2 = boxes[:, 3].clamp_(0, H0 - 1)
                 boxes = torch.stack([x1, y1, x2, y2], dim=1)
 
-            # 面積感知第二道閾值（原圖空間）
+            # 面積感知第二道分數門檻（原圖空間）
             if boxes.numel() > 0 and area_aware:
                 areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
                 thr_vec = torch.full_like(areas, medium_thr, dtype=torch.float32)
@@ -214,7 +219,7 @@ def main():
                 boxes, scores = boxes[k_area], scores[k_area]
 
             # 轉 xywh、Top-K、組 PredictionString（一定輸出 6*n 欄）
-            parts = []
+            parts: List[str] = []
             if boxes.numel() > 0:
                 boxes = xyxy_to_xywh(boxes)
                 if boxes.shape[0] > max_det:
@@ -232,6 +237,7 @@ def main():
             w.writerow([img_id, predstr])
 
     print(f"[Done] CSV saved -> {out_csv}")
+
 
 if __name__ == "__main__":
     main()
