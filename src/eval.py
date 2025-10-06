@@ -26,8 +26,8 @@ from modelv4 import get_fasterrcnn_r50_fpn  # 與 `python src/eval.py` 相容的
 # ========= 可在這裡快速覆寫設定（可留空） =========
 CFG_PATH = "experiments/configs/v5.yaml"
 OVERRIDES = [
-    #"checkpoint.save_full_path=experiments/logs/fasterrcnn_v4.9/fasterrcnn_v4.9_best.pth",
-    #"project.run_name=fasterrcnn_v4_9_best",  # 只影響輸出檔名
+    #"checkpoint.save_full_path=experiments/logs/fasterrcnn_v5.1/fasterrcnn_v5.1.pth",
+    #"project.run_name=fasterrcnn_v5_50e",  # 只影響輸出檔名
 ]
 # =================================================
 

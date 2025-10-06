@@ -51,7 +51,7 @@ augment:
   mosaic: false
 
 train:
-  epochs: 50
+  epochs: 100
   batch_size: 4
   grad_clip: 10.0
   amp: true
@@ -111,6 +111,6 @@ early_stop:
   enabled: true
   monitor: val_loss
   mode: min
-  patience: 8
+  patience: 4
   save_best: true
   best_name: ${project.run_name}_best.pth
