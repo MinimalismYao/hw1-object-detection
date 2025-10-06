@@ -3,7 +3,7 @@ seed: 42
 project:
   name: hw1_od
   seed: 42
-  run_name: fasterrcnn_v5.2
+  run_name: fasterrcnn_v6
   output_root: experiments/logs
   output_dir: ${project.output_root}/${project.run_name}
 
@@ -20,53 +20,61 @@ model:
   detector: fasterrcnn_r50_fpn
   backbone: resnet50
   num_classes: 2
+  # 合規：不使用任何預訓練
+  pretrained_backbone: false
+  # 直接端到端微調（若你的程式支援分段解凍，可在程式內第3epoch解凍）
   freeze_backbone: false
-  pretrained_backbone: false         # ← 對齊 modelv5.py 的參數名稱（原本是 pretrained）
 
   # 與前處理對齊，避免 GeneralizedRCNNTransform 再縮放一次
-  min_size: 1280                     # ← 等同 augment.max_side
+  min_size: 1280
   max_size: 1280
 
-  # === 小物體強化 ===
+  # === 小物體友善 anchors（保持適中，不要太極端避免早期噪音）===
   rpn_anchor_sizes: [[8], [16], [32], [64], [128]]
   rpn_anchor_ratios: [0.5, 1.0, 2.0]
 
-  # 提高 RPN 提案數（訓練/測試）
-  rpn_pre_nms_top_n_train: 4000
-  rpn_post_nms_top_n_train: 2000
-  rpn_pre_nms_top_n_test:  3000
+  # 提案數回落到較穩設定，提升早期收斂穩定性與速度
+  rpn_pre_nms_top_n_train: 2000
+  rpn_post_nms_top_n_train: 1000
+  rpn_pre_nms_top_n_test:  1000
   rpn_post_nms_top_n_test: 1000
   rpn_nms_thresh: 0.7
 
-  # 讓 RCNN 內部的推論閾值 / NMS 與外部設定一致（非必填，但能避免混亂）
+  # 與外部推論參數對齊，避免混亂
   box_score_thresh: ${infer.score_thr}
   box_nms_thresh:   ${infer.nms_iou}
   box_detections_per_img: ${eval.max_det}
 
 augment:
-  max_side: 1330
-  resize: null
+  # 尺寸完全對齊 model.min/max_size，避免二次縮放
+  max_side: 1280
+  # 多尺度短邊抖動：在 640~960 間取隨機短邊，之後再 pad/resize 到 1280 的 pipeline
+  # 若你的程式的 resize 寫法不同，請依你的 dataset 實作調整
+  resize: [640, 960]
   flip_p: 0.5
-  hsv: false
+  hsv: true
   mosaic: false
 
 train:
-  epochs: 100
+  epochs: 60
   batch_size: 4
   grad_clip: 10.0
   amp: true
   cudnn_benchmark: true
-  accumulate: 1
+  # 梯度累積等效放大 batch，讓 early phase 更穩、更快
+  accumulate: 4
 
 optimizer:
   type: sgd
-  lr: 0.003
-  weight_decay: 1.0e-4
+  # 從零訓練、無預訓練：0.01 較積極但仍穩（配合 accumulate 與 grad_clip）
+  lr: 0.01
   momentum: 0.9
+  weight_decay: 5.0e-4
 
 scheduler:
+  # 保留 steplr（若你的程式尚未實作 cosine_warmup）
   type: steplr
-  step_size: 5
+  step_size: 8
   gamma: 0.1
 
 dataloader:
@@ -97,7 +105,8 @@ eval:
   max_det: 100
   save_dir: experiments/eval_results
   result_txt: ${eval.save_dir}/${project.run_name}_results.txt
-  result_json: ${eval.save_dir}/${project.run_name}_details.json}
+  # 修正多餘的大括號
+  result_json: ${eval.save_dir}/${project.run_name}_details.json
 
 infer:
   score_thr: 0.03
@@ -111,6 +120,6 @@ early_stop:
   enabled: true
   monitor: val_loss
   mode: min
-  patience: 4
+  patience: 6
   save_best: true
   best_name: ${project.run_name}_best.pth
