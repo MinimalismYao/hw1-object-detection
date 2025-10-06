@@ -21,11 +21,11 @@ from torchvision.ops import nms as hard_nms
 from tqdm import tqdm
 
 from config import load_cfg
-from modelv4 import get_fasterrcnn_r50_fpn
+from modelv6 import get_fasterrcnn_r50_fpn
 
 
 # ========= 可在這裡快速調整的區域（不需 CLI） =========
-CFG_PATH = "experiments/configs/v5.yaml"
+CFG_PATH = "experiments/configs/v6.yaml"
 OVERRIDES = [
     # 範例覆寫（可留空）
     # "checkpoint.save_full_path=experiments/logs/fasterrcnn_v5.2/fasterrcnn_v5.2_best.pth",
