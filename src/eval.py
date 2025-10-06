@@ -24,7 +24,7 @@ from config import load_cfg
 from modelv6 import get_fasterrcnn_r50_fpn  # 與 `python src/eval.py` 相容的匯入方式
 
 # ========= 可在這裡快速覆寫設定（可留空） =========
-CFG_PATH = "experiments/configs/v5.yaml"
+CFG_PATH = "experiments/configs/v6.yaml"
 OVERRIDES = [
     #"checkpoint.save_full_path=experiments/logs/fasterrcnn_v5.1/fasterrcnn_v5.1.pth",
     #"project.run_name=fasterrcnn_v5_50e",  # 只影響輸出檔名

@@ -56,7 +56,7 @@ augment:
   mosaic: false
 
 train:
-  epochs: 30
+  epochs: 50
   batch_size: 4
   grad_clip: 10.0
   amp: true
