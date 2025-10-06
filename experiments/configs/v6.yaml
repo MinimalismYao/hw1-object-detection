@@ -1,3 +1,8 @@
+# =========================
+# hw1_od · fasterrcnn_v6
+# 小物件強化 + 大物件不漏（完整板 / 修正 resize 為列表）
+# =========================
+
 seed: 42
 
 project:
@@ -15,45 +20,70 @@ data:
   val_gt: data/val/gt_val.txt
   test_img_dir: data/test/img
   num_workers: 16
+  allow_float_bbox: true
+  clip_bbox_to_image: true
+  drop_invalid_bbox: true
+  min_box_wh: [1, 1]
 
 model:
   detector: fasterrcnn_r50_fpn
   backbone: resnet50
   num_classes: 2
-  # 合規：不使用任何預訓練
   pretrained_backbone: false
-  # 直接端到端微調（若你的程式支援分段解凍，可在程式內第3epoch解凍）
   freeze_backbone: false
 
-  # 與前處理對齊，避免 GeneralizedRCNNTransform 再縮放一次
-  min_size: 1280
-  max_size: 1280
+  # 與前處理對齊
+  min_size: 1536
+  max_size: 1536
 
-  # === 小物體友善 anchors（保持適中，不要太極端避免早期噪音）===
-  rpn_anchor_sizes: [[8], [16], [32], [64], [128]]
-  rpn_anchor_ratios: [0.5, 1.0, 2.0]
+  # Anchors（P2~P6）
+  rpn_anchor_sizes: [[16], [32], [64], [128], [512]]
+  rpn_anchor_ratios: [0.33, 0.5, 1.0, 2.0, 3.0]
 
-  # 提案數回落到較穩設定，提升早期收斂穩定性與速度
-  rpn_pre_nms_top_n_train: 2000
-  rpn_post_nms_top_n_train: 1000
-  rpn_pre_nms_top_n_test:  1000
+  # RPN
+  rpn_batch_size_per_image: 512
+  rpn_positive_fraction: 0.5
+  rpn_fg_iou_thresh: 0.6
+  rpn_bg_iou_thresh: 0.2
+  rpn_pre_nms_top_n_train: 4000
+  rpn_post_nms_top_n_train: 2000
+  rpn_pre_nms_top_n_test:  2000
   rpn_post_nms_top_n_test: 1000
   rpn_nms_thresh: 0.7
 
-  # 與外部推論參數對齊，避免混亂
+  # ROI Head
+  box_batch_size_per_image: 1024
+  box_positive_fraction: 0.5
   box_score_thresh: ${infer.score_thr}
   box_nms_thresh:   ${infer.nms_iou}
   box_detections_per_img: ${eval.max_det}
 
 augment:
-  # 尺寸完全對齊 model.min/max_size，避免二次縮放
-  max_side: 1280
-  # 多尺度短邊抖動：在 640~960 間取隨機短邊，之後再 pad/resize 到 1280 的 pipeline
-  # 若你的程式的 resize 寫法不同，請依你的 dataset 實作調整
-  resize: [640, 960]
-  flip_p: 0.5
-  hsv: true
+  # ---- 旗標類（防 KeyError；FRCNN 不建議開）----
   mosaic: false
+  mixup: false
+  cutout: false
+  blur_p: 0.0
+  noise_p: 0.0
+  sharpen_p: 0.0
+  affine_p: 0.0
+  perspective_p: 0.0
+
+  # ---- 關鍵修正：把 resize 寫成「純列表」 ----
+  resize: [896, 1024, 1200, 1400]   # ← transforms 會從這裡抽一個短邊尺寸
+  max_side: 1536                    # 長邊上限（保持平鋪鍵）
+
+  # 其它增強
+  flip_p: 0.5
+  hsv: [0.015, 0.70, 0.40]
+  color_jitter_prob: 0.8
+  color_jitter: [0.2, 0.2, 0.2, 0.05]
+  random_crop_prob: 0.20
+  random_crop_min_iou: 0.5
+  gaussian_blur_prob: 0.10
+  gaussian_blur_sigma: [0.1, 1.0]
+  random_noise_prob: 0.10
+  normalize_mean_std: [[0.485, 0.456, 0.406],[0.229, 0.224, 0.225]]
 
 train:
   epochs: 50
@@ -61,18 +91,25 @@ train:
   grad_clip: 10.0
   amp: true
   cudnn_benchmark: true
-  # 梯度累積等效放大 batch，讓 early phase 更穩、更快
   accumulate: 4
+
+  sampler:
+    enabled: false
+    strategy: "area_weighted"
+    small_quantile: 0.15
+    large_quantile: 0.85
+    small_weight: 2.0
+    large_weight: 1.5
+    normal_weight: 1.0
+    cache_path: ${project.output_dir}/train_sampler_weights.npy
 
 optimizer:
   type: sgd
-  # 從零訓練、無預訓練：0.01 較積極但仍穩（配合 accumulate 與 grad_clip）
   lr: 0.01
   momentum: 0.9
   weight_decay: 5.0e-4
 
 scheduler:
-  # 保留 steplr（若你的程式尚未實作 cosine_warmup）
   type: steplr
   step_size: 8
   gamma: 0.1
@@ -93,7 +130,6 @@ checkpoint:
   name: ${project.run_name}.pth
   save_last_only: true
   save_full_path: ${checkpoint.dir}/${checkpoint.name}
-  # save_fp16: true   # 想讓 ckpt 檔案縮半，可打開
 
 logging:
   csv_name: train_log.csv
@@ -102,16 +138,38 @@ logging:
 
 eval:
   iou_thresholds: [0.50,0.55,0.60,0.65,0.70,0.75,0.80,0.85,0.90,0.95]
-  max_det: 100
+  max_det: 300
   save_dir: experiments/eval_results
   result_txt: ${eval.save_dir}/${project.run_name}_results.txt
-  # 修正多餘的大括號
   result_json: ${eval.save_dir}/${project.run_name}_details.json
+  breakdown_by_area: true
+  area_ranges:
+    small: [0, 1024]       # 32^2
+    medium: [1024, 9216]   # 96^2
+    large: [9216, 1e10]
 
 infer:
-  score_thr: 0.03
-  nms_iou: 0.5
+  score_thr: 0.02
+  nms_iou: 0.6
   submission_csv: submissions/${project.run_name}_submission.csv
+  postproc:
+    soft_nms:
+      enabled: true
+      method: "gaussian"
+      sigma: 0.5
+      iou_thresh: 0.6
+      score_thresh: 0.0
+    area_aware_score:
+      enabled: true
+      small_thr: 0.02
+      medium_thr: 0.04
+      large_thr: 0.06
+      small_area: 1024
+      large_area: 9216
+    topk_per_image: 300
+    temperature_scaling:
+      enabled: false
+      T: 1.0
 
 device:
   cuda: true
