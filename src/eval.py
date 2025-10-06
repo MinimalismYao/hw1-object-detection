@@ -8,6 +8,8 @@ src/eval.py
 做法優化：
 - 收集階段就先對每張影像只保留 Top-K（與 COCO maxDets 對齊）
 - 每個主要階段印出進度（flush=True）
+- ✅ 與訓練「同一份 YAML」建模（anchors/min-max-size/NMS 等完全一致）
+- ✅ 產出更完整的 details JSON（每個 IoU 的 AP/AR 陣列 + S/M/L 區間）
 """
 
 from pathlib import Path
@@ -26,8 +28,8 @@ from modelv6 import get_fasterrcnn_r50_fpn  # 與 `python src/eval.py` 相容的
 # ========= 可在這裡快速覆寫設定（可留空） =========
 CFG_PATH = "experiments/configs/v6.yaml"
 OVERRIDES = [
-    #"checkpoint.save_full_path=experiments/logs/fasterrcnn_v5.1/fasterrcnn_v5.1.pth",
-    #"project.run_name=fasterrcnn_v5_50e",  # 只影響輸出檔名
+    "checkpoint.save_full_path=experiments/logs/fasterrcnn_v6/fasterrcnn_v6_best.pth",
+    # "project.run_name=fasterrcnn_v6_eval",  # 只影響輸出檔名
 ]
 # =================================================
 
@@ -86,7 +88,7 @@ def compute_ap(rec, prec):
     return np.sum((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1])
 
 
-def eval_split(det_records, gt_map_xywh, image_ids, iou_thr, max_dets=None, area_rng=None):
+def eval_split(det_records, gt_map_xywh, image_ids, iou_thr, max_dets=None, area_rng=None, return_curve=False):
     # 篩 det by image + top-k
     if max_dets is not None:
         per_img = defaultdict(list)
@@ -123,10 +125,12 @@ def eval_split(det_records, gt_map_xywh, image_ids, iou_thr, max_dets=None, area
     det_sorted = sorted(dets, key=lambda r: r["score"], reverse=True)
 
     tp, fp = [], []
+    scores_sorted = []
     for det in det_sorted:
         fid = det["image_id"]
         b = torch.tensor(det["box_xyxy"], dtype=torch.float32).unsqueeze(0)
         g = xywh_to_xyxy(gt_use.get(fid, torch.zeros((0, 4), dtype=torch.float32)))
+        scores_sorted.append(det["score"])
         if g.shape[0] == 0:
             tp.append(0); fp.append(1); continue
         ious = torchvision.ops.box_iou(b, g)[0]
@@ -148,6 +152,9 @@ def eval_split(det_records, gt_map_xywh, image_ids, iou_thr, max_dets=None, area
         prec = cum_tp / np.maximum(cum_tp + cum_fp, 1e-12)
         ap = compute_ap(rec, prec)
     ar = float(rec.max()) if rec.size > 0 else 0.0
+
+    if return_curve:
+        return ap, ar, int(num_gt_total), rec.tolist(), prec.tolist(), scores_sorted
     return ap, ar, int(num_gt_total)
 
 
@@ -177,12 +184,15 @@ def main():
     gt_map_xywh = load_gt(gt_txt)
     image_ids = [fid for fid, _ in val_images if fid in gt_map_xywh]
 
-    # 載模型
+    # 載模型（🔥 重點：用同一份 YAML 建模，anchors/min-max-size/NMS 等全同步）
     device = torch.device("cuda" if torch.cuda.is_available() and cfg["device"]["cuda"] else "cpu")
     model = get_fasterrcnn_r50_fpn(
         num_classes=cfg["model"]["num_classes"],
-        freeze_backbone=cfg["model"]["freeze_backbone"]
+        freeze_backbone=cfg["model"]["freeze_backbone"],
+        pretrained_backbone=cfg["model"].get("pretrained_backbone", False),
+        cfg=cfg,  # ← 讓內部以 cfg 覆蓋 anchors / min_size / nms / proposals 等
     ).to(device)
+    model.eval()
 
     # ✅ 優先使用 save_full_path；否則退回 dir/name
     ckpt_cfg  = cfg["checkpoint"]
@@ -202,8 +212,14 @@ def main():
     except TypeError:
         state = torch.load(str(ckpt_path), map_location=device)
     state = _state_to_fp32(state)
-    model.load_state_dict(state)
+    model.load_state_dict(state, strict=True)
     model.eval()
+
+    # （可選）列印關鍵設定，檢查與訓練一致
+    print(f"[Cfg] rpn_anchor_sizes  = {cfg['model']['rpn_anchor_sizes']}")
+    print(f"[Cfg] rpn_anchor_ratios = {cfg['model']['rpn_anchor_ratios']}")
+    print(f"[Cfg] min/max size       = {cfg['model']['min_size']}/{cfg['model']['max_size']}")
+    print(f"[Cfg] nms/score/dets     = {cfg['infer']['nms_iou']}/{cfg['infer']['score_thr']}/{cfg['eval']['max_det']}")
 
     print(f"[1/4] Inference on val images ...", flush=True)
     # 收集偵測（每張圖預先限制 Top-K，加速後續評分）
@@ -239,18 +255,22 @@ def main():
     }
 
     print(f"[2/4] Computing AP (IoU=0.50:0.95, area=all, maxDets={max_dets_cfg}) ...", flush=True)
-    aps = []
+    aps_all = []
     for thr in iou_list:
         ap, _, _ = eval_split(det_records, gt_map_xywh, image_ids, thr, max_dets=max_dets_cfg, area_rng=area_ranges["all"])
-        aps.append(ap)
-    ap_50_95 = float(np.mean(aps) if aps else 0.0)
+        aps_all.append(ap)
+    ap_50_95 = float(np.mean(aps_all) if aps_all else 0.0)
 
     print(f"[3/4] Computing AP by IoU (0.50/0.75) and by area (S/M/L) ...", flush=True)
     ap_50, _, _ = eval_split(det_records, gt_map_xywh, image_ids, 0.50, max_dets=max_dets_cfg, area_rng=area_ranges["all"])
     ap_75, _, _ = eval_split(det_records, gt_map_xywh, image_ids, 0.75, max_dets=max_dets_cfg, area_rng=area_ranges["all"])
-    ap_small  = float(np.mean([eval_split(det_records, gt_map_xywh, image_ids, t, max_dets_cfg, area_ranges["small"])[0]  for t in iou_list]))
-    ap_medium = float(np.mean([eval_split(det_records, gt_map_xywh, image_ids, t, max_dets_cfg, area_ranges["medium"])[0] for t in iou_list]))
-    ap_large  = float(np.mean([eval_split(det_records, gt_map_xywh, image_ids, t, max_dets_cfg, area_ranges["large"])[0]  for t in iou_list]))
+
+    aps_s = [eval_split(det_records, gt_map_xywh, image_ids, t, max_dets=max_dets_cfg, area_rng=area_ranges["small"])[0]  for t in iou_list]
+    aps_m = [eval_split(det_records, gt_map_xywh, image_ids, t, max_dets=max_dets_cfg, area_rng=area_ranges["medium"])[0] for t in iou_list]
+    aps_l = [eval_split(det_records, gt_map_xywh, image_ids, t, max_dets=max_dets_cfg, area_rng=area_ranges["large"])[0]  for t in iou_list]
+    ap_small  = float(np.mean(aps_s))
+    ap_medium = float(np.mean(aps_m))
+    ap_large  = float(np.mean(aps_l))
 
     print(f"[4/4] Computing AR (maxDets=1/10/100) ...", flush=True)
     def mean_ar(max_dets, area_key):
@@ -258,16 +278,16 @@ def main():
         for thr in iou_list:
             _, ar, _ = eval_split(det_records, gt_map_xywh, image_ids, thr, max_dets=max_dets, area_rng=area_ranges[area_key])
             ars.append(ar)
-        return float(np.mean(ars) if ars else 0.0)
+        return float(np.mean(ars) if ars else 0.0), ars
 
-    ar_1_all   = mean_ar(1,   "all")
-    ar_10_all  = mean_ar(10,  "all")
-    ar_100_all = mean_ar(100, "all")
-    ar_100_s   = mean_ar(100, "small")
-    ar_100_m   = mean_ar(100, "medium")
-    ar_100_l   = mean_ar(100, "large")
+    ar_1_all,   ars_1_all   = mean_ar(1,   "all")
+    ar_10_all,  ars_10_all  = mean_ar(10,  "all")
+    ar_100_all, ars_100_all = mean_ar(100, "all")
+    ar_100_s,   ars_100_s   = mean_ar(100, "small")
+    ar_100_m,   ars_100_m   = mean_ar(100, "medium")
+    ar_100_l,   ars_100_l   = mean_ar(100, "large")
 
-    # 輸出
+    # 輸出（摘要）
     lines = []
     lines.append("===== COCO Evaluation Summary =====\n")
     lines.append(f"AP @[ IoU=0.50:0.95 | area=all | maxDets={max_dets_cfg} ]              = {ap_50_95:.6f}")
@@ -286,7 +306,7 @@ def main():
     lines.append("- AP: 平均精度；AR: 平均召回；主指標為 AP@[0.50:0.95]（COCO 標準）。")
     lines.append("- precision 的維度為 [IoU x recall x category x area x maxDets]。")
     lines.append("- recall    的維度為 [IoU x category x area x maxDets]（每個 IoU 的最大可達召回）。")
-    lines.append("- 詳細陣列請見 eval_details.json（可用來畫曲線）。")
+    lines.append("- 詳細陣列請見 *_details.json（可用來畫曲線與分析 S/M/L）。")
 
     out_txt = Path(cfg["eval"]["result_txt"])
     out_json = Path(cfg["eval"]["result_json"])
@@ -294,21 +314,38 @@ def main():
     out_json.parent.mkdir(parents=True, exist_ok=True)
     out_txt.write_text("\n".join(lines), encoding="utf-8")
 
+    # 輸出（細節 JSON：每個 IoU 的 AP/AR 列表 + 面積分段）
     details = {
-        "AP_50_95": ap_50_95,
-        "AP_50": ap_50,
-        "AP_75": ap_75,
-        "AP_small": ap_small,
-        "AP_medium": ap_medium,
-        "AP_large": ap_large,
-        "AR_1_all": ar_1_all,
-        "AR_10_all": ar_10_all,
-        "AR_100_all": ar_100_all,
-        "AR_100_small": ar_100_s,
-        "AR_100_medium": ar_100_m,
-        "AR_100_large": ar_100_l,
-        "iou_list": iou_list,
-        "max_dets_eval": max_dets_cfg,
+        "AP_main": {
+            "AP_50_95": ap_50_95,
+            "AP_50": ap_50,
+            "AP_75": ap_75,
+        },
+        "AP_by_IoU": {
+            "IoUs": iou_list,
+            "AP_all": aps_all,
+            "AP_small": aps_s,
+            "AP_medium": aps_m,
+            "AP_large": aps_l,
+        },
+        "AR_by_IoU_and_maxDets": {
+            "IoUs": iou_list,
+            "AR@1_all":   ars_1_all,
+            "AR@10_all":  ars_10_all,
+            "AR@100_all": ars_100_all,
+            "AR@100_S":   ars_100_s,
+            "AR@100_M":   ars_100_m,
+            "AR@100_L":   ars_100_l,
+        },
+        "cfg_refs": {
+            "rpn_anchor_sizes": cfg["model"]["rpn_anchor_sizes"],
+            "rpn_anchor_ratios": cfg["model"]["rpn_anchor_ratios"],
+            "min_size": cfg["model"]["min_size"],
+            "max_size": cfg["model"]["max_size"],
+            "box_score_thresh": cfg["infer"]["score_thr"],
+            "box_nms_thresh": cfg["infer"]["nms_iou"],
+            "max_dets_eval": max_dets_cfg,
+        },
     }
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(details, f, indent=2, ensure_ascii=False)

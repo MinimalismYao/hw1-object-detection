@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-trainv6.py — Faster R-CNN ResNet50-FPN (from scratch, YAML-driven)
+trainv6.py — YAML-driven detector training (no pretrained weights)
 對應：modelv6.py、transforms.py、experiments/configs/v6.yaml
+
+重點更新：
+1) 改為由 YAML 的 model.detector 建模（透過 modelv6.build_detector_from_cfg）
+   - 可選：fasterrcnn_r50_fpn / fasterrcnn_mbv3_fpn / fasterrcnn_r101_fpn / retinanet_r50_fpn / ssdlite_mbv3
+2) 其餘流程（資料管線、AMP、early-stop、accumulate、StepLR）保持不變
 """
 
 import os, time, math, traceback, sys, random
@@ -17,7 +22,8 @@ from tqdm import tqdm
 
 from dataset import PigsDataset, collate_fn
 from transforms import get_transforms
-from modelv6 import get_fasterrcnn_r50_fpn
+# from modelv6 import get_fasterrcnn_r50_fpn
+from modelv6 import build_detector_from_cfg  # ← 改用模型工廠
 from omegaconf import OmegaConf
 from config import load_cfg
 
@@ -87,7 +93,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch_idx, total_epochs,
         else:
             loss_scaled.backward()
 
-        if step % accumulate == 0:
+        if step % max(1, accumulate) == 0:
             if grad_clip:
                 if amp and scaler is not None:
                     scaler.unscale_(optimizer)
@@ -113,7 +119,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch_idx, total_epochs,
 
 @torch.no_grad()
 def validate_one_epoch(model, loader, device, amp=False):
-    model.train()  # torchvision detection head 需要 train 模式才能回傳 loss
+    model.train()  # torchvision detection head 在 train 模式回傳 loss
     total, n = 0.0, 0
     autocast_ctx = torch.amp.autocast("cuda") if (amp and device.type == "cuda") else nullcontext()
     for images, targets in loader:
@@ -145,7 +151,6 @@ def main():
         print("[WARN] OmegaConf resolve 失敗，改用原始 cfg（${...} 不會被展開）")
         cfg = cfg_raw
 
-
     # 2) 固定隨機種子 & CUDNN
     seed = int(cfg.get("project", {}).get("seed", 42))
     random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
@@ -154,12 +159,10 @@ def main():
     device = torch.device("cuda" if (cfg["device"]["cuda"] and torch.cuda.is_available()) else "cpu")
     print(f"[Device] {device}")
 
-    # 3) 模型
-    model = get_fasterrcnn_r50_fpn(
-        num_classes=cfg["model"]["num_classes"],
-        cfg=cfg  # 讓 modelv6.py 讀到 model.* / augment.max_side 等
-    ).to(device)
-    print("[DBG] model built OK")
+    # 3) 模型（從 YAML 的 model.detector 建模）
+    model = build_detector_from_cfg(cfg).to(device)
+    det_name = str(cfg.get("model", {}).get("detector", "fasterrcnn_r50_fpn"))
+    print(f"[DBG] model built OK — detector={det_name}")
 
     # 4) Sanity check
     if cfg["sanity_check"]["enabled"]:
@@ -214,7 +217,7 @@ def main():
     )
 
     scheduler = None
-    if cfg["scheduler"]["type"].lower() == "steplr":
+    if str(cfg["scheduler"]["type"]).lower() == "steplr":
         scheduler = StepLR(
             optimizer,
             step_size=int(cfg["scheduler"]["step_size"]),
@@ -292,4 +295,3 @@ if __name__ == "__main__":
         print("\n[DBG] Uncaught exception!\n", file=sys.stderr)
         traceback.print_exc()
         raise
-
