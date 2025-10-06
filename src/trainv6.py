@@ -173,13 +173,17 @@ def main():
         train=True,
         max_side=cfg["augment"]["max_side"],
         flip_p=cfg["augment"]["flip_p"],
-        hsv=cfg["augment"]["hsv"],
+        hsv=cfg["augment"]["hsv"],                       # ← 改為可傳 [h,s,v]
         resize=cfg["augment"]["resize"],
         mosaic=cfg["augment"]["mosaic"],
+        min_box_size=float(cfg["data"]["min_box_wh"][0]),# ← 接 data.min_box_wh
+        color_jitter_prob=cfg["augment"]["color_jitter_prob"],
+        color_jitter=cfg["augment"]["color_jitter"],     # ← [b,c,s,h]
     )
     val_tfms = get_transforms(
         train=False,
         max_side=cfg["augment"]["max_side"],
+        min_box_size=float(cfg["data"]["min_box_wh"][0]),# ← 驗證集同樣門檻
     )
 
     ds_train = PigsDataset(cfg["data"]["train_img_dir"], cfg["data"]["train_gt"], transforms=train_tfms)

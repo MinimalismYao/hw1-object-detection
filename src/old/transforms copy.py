@@ -61,34 +61,18 @@ class TrainTransforms:
         self,
         max_side: int = 800,
         flip_p: float = 0.5,
-        hsv: Optional[List[float]] = None,        # 期望 [h, s, v]；若為 bool/None 則忽略
+        hsv: bool = True,
         resize_list: Optional[List[int]] = None,
         mosaic: bool = False,
         min_box_size: float = 1.0,
-        color_jitter_prob: float = 0.0,           # 0~1
-        color_jitter: Optional[List[float]] = None # [b,c,s,h]
     ):
         self.max_side = int(max_side)
         self.flip_p = float(flip_p)
+        self.use_color = bool(hsv)
         self.resize_list = resize_list if (resize_list and len(resize_list) > 0) else None
         self.mosaic = bool(mosaic)
         self.min_box_size = float(min_box_size)
-
-        # 顏色增強策略：優先 color_jitter，否則根據 hsv 映射
-        self.cj_prob = float(color_jitter_prob)
-        if color_jitter and len(color_jitter) == 4:
-            b, c, s, h = map(float, color_jitter)
-            self.color = T.ColorJitter(brightness=b, contrast=c, saturation=s, hue=h)
-        elif isinstance(hsv, (list, tuple)) and len(hsv) == 3:
-            # YOLO 式 hsv: [h, s, v] -> ColorJitter(hue, saturation, brightness)
-            h, s, v = float(hsv[0]), float(hsv[1]), float(hsv[2])
-            # hue in ColorJitter expects [-0.5, 0.5], v/s >=0
-            hue = max(0.0, min(abs(h), 0.5))
-            self.color = T.ColorJitter(brightness=max(0.0, v), contrast=0.0, saturation=max(0.0, s), hue=hue)
-            self.cj_prob = max(self.cj_prob, 0.8)  # 若使用 hsv，給個較高機率（與 YAML 一致）
-        else:
-            self.color = None
-            self.cj_prob = 0.0
+        self.color = T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2)
 
     def __call__(self, img_np: np.ndarray, target: Dict):
         img = Image.fromarray(img_np)
@@ -106,8 +90,7 @@ class TrainTransforms:
                 img = img.transpose(Image.FLIP_LEFT_RIGHT)
                 target["boxes"] = _hflip_boxes(target["boxes"], w)
 
-        # 顏色增強（若設定）
-        if self.color is not None and torch.rand(1).item() < self.cj_prob:
+        if self.use_color:
             img = self.color(img)
 
         w_final, h_final = img.size
@@ -118,7 +101,7 @@ class TrainTransforms:
             if "labels" in target:
                 target["labels"] = target["labels"][keep]
 
-        img = T.ToTensor()(img)  # 不做 Normalize，統一交給 model 端
+        img = T.ToTensor()(img)
         return img, target
 
 class ValTransforms:
@@ -138,7 +121,7 @@ class ValTransforms:
             if "labels" in target:
                 target["labels"] = target["labels"][keep]
 
-        img = T.ToTensor()(img)  # 不做 Normalize
+        img = T.ToTensor()(img)
         return img, target
 
 def get_transforms(
@@ -146,24 +129,20 @@ def get_transforms(
     *,
     max_side: int = 800,
     flip_p: float = 0.5,
-    hsv: Optional[Union[List[float], Tuple[float, float, float]]] = None,
+    hsv: bool = True,
     resize: Optional[Union[List[int], Tuple[int, ...]]] = None,
     mosaic: bool = False,
     min_box_size: float = 1.0,
-    color_jitter_prob: float = 0.0,
-    color_jitter: Optional[Union[List[float], Tuple[float, float, float, float]]] = None,
 ):
     if train:
         resize_list = list(resize) if resize is not None else None
         return TrainTransforms(
             max_side=max_side,
             flip_p=flip_p,
-            hsv=list(hsv) if hsv is not None else None,
+            hsv=hsv,
             resize_list=resize_list,
             mosaic=mosaic,
             min_box_size=min_box_size,
-            color_jitter_prob=color_jitter_prob,
-            color_jitter=list(color_jitter) if color_jitter is not None else None,
         )
     else:
         return ValTransforms(max_side=max_side, min_box_size=min_box_size)
