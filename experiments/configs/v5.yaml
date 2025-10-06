@@ -3,7 +3,7 @@ seed: 42
 project:
   name: hw1_od
   seed: 42
-  run_name: fasterrcnn_v5
+  run_name: fasterrcnn_v5.1
   output_root: experiments/logs
   output_dir: ${project.output_root}/${project.run_name}
 
