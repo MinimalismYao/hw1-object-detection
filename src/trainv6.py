@@ -133,8 +133,18 @@ def main():
     print(f"[DBG] CFG_PATH={cfg_path} -> exists={cfg_path.exists()}")
 
     # 1) 載入 + resolve YAML
-    cfg_raw = load_cfg(str(cfg_path))
-    cfg = OmegaConf.to_container(cfg_raw, resolve=True)  # 展開 ${...}，轉成純 dict
+    cfg_raw = load_cfg(str(cfg_path))  # 可能回傳 OmegaConf 或普通 dict
+    try:
+        if OmegaConf.is_config(cfg_raw):
+            cfg = OmegaConf.to_container(cfg_raw, resolve=True)
+        else:
+            # 將普通 dict 包成 OmegaConf，再做變數展開（支援 ${...}）
+            cfg = OmegaConf.to_container(OmegaConf.create(cfg_raw), resolve=True)
+    except Exception:
+        # 保底：就用原始 dict（不展開 ${...}），但不建議
+        print("[WARN] OmegaConf resolve 失敗，改用原始 cfg（${...} 不會被展開）")
+        cfg = cfg_raw
+
 
     # 2) 固定隨機種子 & CUDNN
     seed = int(cfg.get("project", {}).get("seed", 42))
@@ -212,7 +222,7 @@ def main():
         )
 
     use_amp = bool(cfg["train"]["amp"])
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler(enabled=use_amp)
     accumulate = int(cfg["train"].get("accumulate", 1))
     grad_clip = float(cfg["train"].get("grad_clip", 0.0)) or None
     print_interval = int(cfg["logging"].get("print_interval", 10))
@@ -263,14 +273,16 @@ def main():
             torch.save(model.state_dict(), ckpt_best)
             print(f"[Save][best] {ckpt_best}")
 
-    # 8) save last
+    # 8) save last / or per-epoch
     save_last_only = bool(cfg["checkpoint"].get("save_last_only", True))
     if save_last_only:
         torch.save(model.state_dict(), ckpt_last)
         print(f"[Save][last] {ckpt_last}")
     else:
-        torch.save(model.state_dict(), ckpt_dir / f"{cfg['project']['run_name']}_epoch{epoch+1}.pth")
-        print(f"[Save][epoch] {ckpt_dir / f'{cfg['project']['run_name']}_epoch{epoch+1}.pth'}")
+        save_name = f"{cfg['project']['run_name']}_epoch{epoch+1}.pth"
+        save_path = ckpt_dir / save_name
+        torch.save(model.state_dict(), save_path)
+        print(f"[Save][epoch] {save_path}")
 
 
 if __name__ == "__main__":
@@ -280,3 +292,4 @@ if __name__ == "__main__":
         print("\n[DBG] Uncaught exception!\n", file=sys.stderr)
         traceback.print_exc()
         raise
+
