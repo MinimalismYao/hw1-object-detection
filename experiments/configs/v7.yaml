@@ -1,26 +1,13 @@
 # =========================
-# hw1_od · fasterrcnn_v6 (Stable on 3080)
-# 重點：顯存穩 + 不卡 I/O
-# - 輸入改 1280（多尺度：768/960/1152/1280）
-# - batch_size=2 + accumulate=8 保持等效大 batch
-# - 降低 RPN/ROI 的 proposals/樣本數，降低 VRAM 風險
-# - DataLoader 降 worker/prefetch，避免磁碟/CPU 互踩
-# 如果你一定要 1536 輸入，見下方「# 1536 模式」註解
+# hw1_od · retinanet_v7 (Small-object friendly, Stable on 3080/1650)
+# 重點：一階段 RetinaNet + 小物件長條 anchors + Soft-NMS + Tiling 推論
+# - 輸入維持 1280；若想衝更高可再測 1536（見底部註解）
+# - RetinaNet 無 RPN/ROI，VRAM 較省；Focal Loss 對密集場景更穩
+# - 自訂 anchors（小 + 長條）對俯視豬群特別有效
+# - 推論端加入 Tiling（2×2 或 3×2 覆蓋）+ Soft-NMS + TopK
 # =========================
-#fasterrcnn_r50_fpn（two-stage, 中等容量）
-#穩定好調、對中大型物體表現穩；RPN+RoI 使小物件需要更細的 anchor/尺寸策略才能拉起。訓練時間中等，記憶體需求中等。
-
-#fasterrcnn_mbv3_fpn（two-stage, 輕量）
-#用 MobileNetV3 骨幹，參數/算力需求低，適合快速迭代或較弱的 GPU；準度略低於 R50，但速度與穩定性很好。
-
-#fasterrcnn_r101_fpn（two-stage, 大容量）
-#特徵表達更強，對複雜外觀、遮擋有幫助；訓練慢、VRAM 吃重，較容易過擬合，需規律正則/early-stop。
-
 #retinanet_r50_fpn（one-stage, 密集偵測）
 #Focal Loss 抑制易樣本，通常對小物件/密集場景更友善；推論較快、記憶體較省（無 RoI 阶段），調到對就常見到小物件 AP 明顯回升。
-
-#ssdlite_mbv3（one-stage, 超輕量）
-#速度極快、資源消耗最低；適合 baseline 建立與快速 A/B，精度通常低於 RetinaNet/FasterRCNN，但在 3080 上可超高速反覆測。
 # =========================
 
 seed: 42
@@ -28,7 +15,7 @@ seed: 42
 project:
   name: hw1_od
   seed: 42
-  run_name: fasterrcnn_v6
+  run_name: retinanet_v7
   output_root: experiments/logs
   output_dir: ${project.output_root}/${project.run_name}
 
@@ -39,17 +26,22 @@ data:
   val_img_dir: data/val/img
   val_gt: data/val/gt_val.txt
   test_img_dir: data/test/img
-  num_workers: 8             # ↓ from 16，避免 I/O 過度前置
+  num_workers: 8
   allow_float_bbox: true
   clip_bbox_to_image: true
   drop_invalid_bbox: true
   min_box_wh: [1, 1]
 
 model:
-  # 可選：fasterrcnn_r50_fpn / fasterrcnn_mbv3_fpn / fasterrcnn_r101_fpn / retinanet_r50_fpn / ssdlite_mbv3
-  detector: fasterrcnn_r50_fpn
+  # v7：切換為 RetinaNet
+  detector: retinanet_r50_fpn
   backbone: resnet50
+
+  # 注意：
+  # - 若你的封裝沿用 Faster R-CNN 的「含背景」慣例，就維持 2；
+  # - 若直接用 torchvision.retinanet_resnet50_fpn，官方 API 的 num_classes 是「不含背景」→ 單類別請改 1。
   num_classes: 2
+
   pretrained_backbone: false
   freeze_backbone: false
 
@@ -58,33 +50,20 @@ model:
   image_std:  [0.229, 0.224, 0.225]
 
   # 輸入尺寸（穩定：1280）
-  min_size: 1280            # ← 1536 模式請改回 1536
+  min_size: 1280
   max_size: 1280
 
-  # Anchors（FPN：P2~P6；小物件友善）
-  rpn_anchor_sizes: [[16], [32], [64], [128], [512]]
-  rpn_anchor_ratios: [0.33, 0.5, 1.0, 2.0, 3.0]
+  # ===== RetinaNet Anchors（小物件＋長條）=====
+  # 5 層 FPN 的金字塔基準尺寸（以豬群俯視的長條外觀為主）
+  retinanet_anchor_sizes: [16, 32, 64, 128, 256]
+  retinanet_anchor_aspect_ratios: [1.0, 2.0, 3.0]
 
-  # RPN（瘦身，降 VRAM）
-  rpn_batch_size_per_image: 512
-  rpn_positive_fraction: 0.5
-  rpn_fg_iou_thresh: 0.6
-  rpn_bg_iou_thresh: 0.2
-  rpn_pre_nms_top_n_train: 4000   
-  rpn_post_nms_top_n_train: 2000  
-  rpn_pre_nms_top_n_test:  2000  
-  rpn_post_nms_top_n_test: 1000    
-  rpn_nms_thresh: 0.7
-
-  # ROI Head（瘦身，降 VRAM）
-  box_batch_size_per_image: 1024 
-  box_positive_fraction: 0.5
-  box_score_thresh: ${infer.score_thr}
-  box_nms_thresh:   ${infer.nms_iou}
-  box_detections_per_img: ${eval.max_det}
+  # （可選）Focal Loss 係數微調：gamma 1.5~2.5、alpha 0.25~0.5
+  focal_loss_gamma: 2.0
+  focal_loss_alpha: 0.25
 
 augment:
-  # ---- 旗標類（FRCNN 不建議開）----
+  # ---- 旗標類（RetinaNet 也不建議 mosaic/mixup 在此作業）----
   mosaic: false
   mixup: false
   cutout: false
@@ -95,10 +74,10 @@ augment:
   perspective_p: 0.0
 
   # ---- Resize（短邊候選清單，長邊上限）----
-  resize: [768, 960, 1152, 1280]  # ← 1280 穩定版
+  resize: [768, 960, 1152, 1280]
   max_side: 1280
 
-  # 其它增強
+  # 其它增強（保持你原設定）
   flip_p: 0.5
   hsv: [0.015, 0.70, 0.40]
   color_jitter_prob: 0.8
@@ -114,12 +93,13 @@ augment:
 
 train:
   epochs: 36
-  batch_size: 2             # ↓ from 4，顯存更穩
+  batch_size: 2
   grad_clip: 10.0
   amp: true
   cudnn_benchmark: true
-  accumulate: 8             # ↑ from 4，維持等效大 batch
+  accumulate: 8
 
+  # RetinaNet 不需要 FRCNN 的 sampler；若你仍想偏重小物件，可保留你自訂的 DataSampler
   sampler:
     enabled: false
     strategy: "area_weighted"
@@ -144,7 +124,7 @@ scheduler:
 dataloader:
   pin_memory: true
   persistent_workers: true
-  prefetch_factor: 2        # ↓ from 4，降低 I/O 壓力
+  prefetch_factor: 2
   shuffle: true
 
 sanity_check:
@@ -175,12 +155,14 @@ eval:
     small: [0, 1024]       # 32^2
     medium: [1024, 9216]   # 96^2
     large: [9216, 1e10]
-  
 
 infer:
-  score_thr: 0.02
+  # RetinaNet 的分類分數通常較保守，先用 0.05 起手
+  score_thr: 0.05
   nms_iou: 0.6
   submission_csv: submissions/${project.run_name}_submission.csv
+
+  # ===== 推論強化：Soft-NMS + 面積感知 + TopK + Tiling =====
   postproc:
     soft_nms:
       enabled: true
@@ -200,6 +182,14 @@ infer:
       enabled: false
       T: 1.0
 
+  tiling:
+    enabled: true
+    mode: "grid"
+    tile_size: 1024
+    overlap: 0.15      # 10~15% 推薦
+    pad: 0             # 如需邊緣對齊可設置到 32 的倍數
+    merge_strategy: "nms"  # nms | soft_nms（與上方參數共用）
+
 device:
   cuda: true
 
@@ -215,14 +205,14 @@ early_stop:
 # model:
 #   min_size: 1536
 #   max_size: 1536
-#   box_batch_size_per_image: 512
-#   rpn_pre_nms_top_n_train: 2000
-#   rpn_post_nms_top_n_train: 1000
-#   rpn_pre_nms_top_n_test:  1000
-#   rpn_post_nms_top_n_test: 500
+#   retinanet_anchor_sizes: [16, 32, 64, 128, 256]   # 可維持，或再加一層 512 視 VRAM
 # augment:
 #   resize: [896, 1024, 1200, 1400]
 #   max_side: 1536
 # train:
 #   batch_size: 2
 #   accumulate: 8
+# infer:
+#   tiling:
+#     tile_size: 1280
+#     overlap: 0.15

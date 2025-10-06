@@ -1,14 +1,15 @@
-# src/modelv6.py
+# src/modelv7.py
 import torch
 import torch.nn as nn
 import torchvision
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, Sequence
 
 from torchvision.models.detection import FasterRCNN
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.rpn import AnchorGenerator
 from torchvision.ops import MultiScaleRoIAlign
 from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
+
 
 # ---------- utils ----------
 def _as_tuple_sizes(sizes_like):
@@ -34,7 +35,7 @@ def _as_tuple_sizes(sizes_like):
             else:
                 out.append((int(s),))
         return tuple(out)
-    raise TypeError(f"Unsupported type for rpn_anchor_sizes: {type(sizes_like)}")
+    raise TypeError(f"Unsupported type for sizes: {type(sizes_like)}")
 
 
 def _maybe_get(d: Dict[str, Any], path: str, default=None):
@@ -46,7 +47,7 @@ def _maybe_get(d: Dict[str, Any], path: str, default=None):
     return cur
 
 
-# ---------- Faster R-CNN R50-FPN（原始路線，保留） ----------
+# ---------- Faster R-CNN R50-FPN（保留） ----------
 def get_fasterrcnn_r50_fpn(
     num_classes: int = 2,
     freeze_backbone: bool = False,
@@ -79,7 +80,6 @@ def get_fasterrcnn_r50_fpn(
     """
     # ---- 1) 從 cfg 覆蓋參數（若存在）----
     acfg = _maybe_get(cfg or {}, "augment", {}) if cfg else {}
-    # Transform 尺寸：若沒指定，沿用 augment.max_side；否則 fallback 1024
     min_size = _maybe_get(cfg or {}, "model.min_size", min_size)
     max_size = _maybe_get(cfg or {}, "model.max_size", max_size)
     if min_size is None and acfg:
@@ -89,16 +89,13 @@ def get_fasterrcnn_r50_fpn(
     if min_size is None: min_size = 1024
     if max_size is None: max_size = 1024
 
-    # image mean/std（若 YAML 有就覆蓋）
     image_mean = list(_maybe_get(cfg or {}, "model.image_mean", image_mean))
     image_std  = list(_maybe_get(cfg or {}, "model.image_std",  image_std))
 
-    # Anchors
     rpn_anchor_sizes = _maybe_get(cfg or {}, "model.rpn_anchor_sizes", rpn_anchor_sizes)
     sizes_tuple = _as_tuple_sizes(rpn_anchor_sizes) if rpn_anchor_sizes is not None else ((32,), (64,), (128,), (256,), (512,))
     rpn_anchor_ratios = _maybe_get(cfg or {}, "model.rpn_anchor_ratios", list(rpn_anchor_ratios))
 
-    # RPN / ROI / Inference
     rpn_pre_nms_top_n_train = int(_maybe_get(cfg or {}, "model.rpn_pre_nms_top_n_train", rpn_pre_nms_top_n_train))
     rpn_post_nms_top_n_train = int(_maybe_get(cfg or {}, "model.rpn_post_nms_top_n_train", rpn_post_nms_top_n_train))
     rpn_pre_nms_top_n_test  = int(_maybe_get(cfg or {}, "model.rpn_pre_nms_top_n_test",  rpn_pre_nms_top_n_test))
@@ -116,10 +113,8 @@ def get_fasterrcnn_r50_fpn(
     if pretrained_backbone and not freeze_backbone:
         freeze_backbone = True  # 自動修正為合規設定
 
-    # ---- 2) Backbone with FPN（官方工具）----
-    #   weights=None：from scratch；若要預訓練 backbone，會在新版用 ResNet50_Weights.DEFAULT
+    # ---- 2) Backbone with FPN ----
     if pretrained_backbone:
-        # 注意：我們雖給 weights，但因 freeze_backbone=True，等同「僅特徵抽取」
         try:
             weights = torchvision.models.ResNet50_Weights.DEFAULT
         except AttributeError:
@@ -127,9 +122,7 @@ def get_fasterrcnn_r50_fpn(
     else:
         weights = None
 
-    # trainable_layers：若凍結（feature extractor），則設 0；否則 5 全開
     trainable_layers = 0 if freeze_backbone else 5
-
     backbone = resnet_fpn_backbone(
         backbone_name="resnet50",
         weights=weights,
@@ -171,15 +164,12 @@ def get_fasterrcnn_r50_fpn(
         box_detections_per_img=int(box_detections_per_img),
     )
 
-    # ---- 5) 雙重保險：顯式凍結 backbone 參數（若需）----
     if freeze_backbone:
         for p in model.backbone.parameters():
             p.requires_grad_(False)
 
-    # ---- 6) 保險：替換分類頭以確保 num_classes 正確 ----
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
-
     return model
 
 
@@ -187,8 +177,6 @@ def get_fasterrcnn_r50_fpn(
 def get_fasterrcnn_mbv3_fpn(num_classes=2, *, min_size=None, max_size=None,
                              image_mean=(0.0,0.0,0.0), image_std=(1.0,1.0,1.0),
                              cfg: Optional[Dict[str, Any]] = None):
-    # torchvision 內建：MobileNetV3 + FPN 的 FasterRCNN
-    # 嚴格禁止任何預訓練：
     model = torchvision.models.detection.fasterrcnn_mobilenet_v3_large_fpn(
         weights=None, weights_backbone=None,
         min_size=_maybe_get(cfg or {}, "model.min_size", min_size),
@@ -203,14 +191,12 @@ def get_fasterrcnn_mbv3_fpn(num_classes=2, *, min_size=None, max_size=None,
 def get_fasterrcnn_r101_fpn(num_classes=2, *, min_size=None, max_size=None,
                              image_mean=(0.0,0.0,0.0), image_std=(1.0,1.0,1.0),
                              cfg: Optional[Dict[str, Any]] = None):
-    # ResNet101 + FPN（容量更大）
     min_size = _maybe_get(cfg or {}, "model.min_size", min_size)
     max_size = _maybe_get(cfg or {}, "model.max_size", max_size)
     image_mean = list(_maybe_get(cfg or {}, "model.image_mean", image_mean))
     image_std  = list(_maybe_get(cfg or {}, "model.image_std",  image_std))
 
     backbone = resnet_fpn_backbone('resnet101', weights=None, trainable_layers=5, norm_layer=nn.BatchNorm2d)
-    # Anchor 設定與 R50 版一致（若 YAML 有提供）
     rpn_anchor_sizes = _maybe_get(cfg or {}, "model.rpn_anchor_sizes", None)
     sizes_tuple = _as_tuple_sizes(rpn_anchor_sizes) if rpn_anchor_sizes is not None else ((32,), (64,), (128,), (256,), (512,))
     rpn_anchor_ratios = _maybe_get(cfg or {}, "model.rpn_anchor_ratios", [0.5, 1.0, 2.0])
@@ -242,14 +228,43 @@ def get_fasterrcnn_r101_fpn(num_classes=2, *, min_size=None, max_size=None,
 def get_retinanet_r50_fpn(num_classes=2, *, min_size=None, max_size=None,
                           image_mean=(0.0,0.0,0.0), image_std=(1.0,1.0,1.0),
                           cfg: Optional[Dict[str, Any]] = None):
-    # 一階式密集偵測；Focal Loss 對小物件/類別不均衡較友善
+    """
+    RetinaNet-R50-FPN
+    - 可自訂 anchors：model.retinanet_anchor_sizes（例：[16,32,64,128,256]）
+                     model.retinanet_anchor_aspect_ratios（例：[1.0,2.0,3.0]）
+    - 注意 torchvision 的 RetinaNet num_classes = 「實際類別數」（不含背景）。
+      若 YAML 仍沿用「單類別+背景=2」的習慣，這裡會自動轉成 1。
+    """
+    # 1) 解析尺寸與正規化
+    min_size = _maybe_get(cfg or {}, "model.min_size", min_size)
+    max_size = _maybe_get(cfg or {}, "model.max_size", max_size)
+    image_mean = list(_maybe_get(cfg or {}, "model.image_mean", image_mean))
+    image_std  = list(_maybe_get(cfg or {}, "model.image_std",  image_std))
+
+    # 2) 解析 anchors（優先用 retinanet_*，退回 rpn_* 或預設金字塔）
+    anc_sizes = _maybe_get(cfg or {}, "model.retinanet_anchor_sizes", None)
+    if anc_sizes is None:
+        anc_sizes = _maybe_get(cfg or {}, "model.rpn_anchor_sizes", [16, 32, 64, 128, 256])
+    sizes_tuple = _as_tuple_sizes(anc_sizes)
+    while len(sizes_tuple) < 5:  # 補到 5 層
+        sizes_tuple += (sizes_tuple[-1],)
+    sizes_tuple = sizes_tuple[:5]
+
+    anc_ratios = _maybe_get(cfg or {}, "model.retinanet_anchor_aspect_ratios",
+                            _maybe_get(cfg or {}, "model.rpn_anchor_ratios", [1.0, 2.0, 3.0]))
+    ratios_per_level = (tuple(float(r) for r in anc_ratios),) * len(sizes_tuple)
+    anchor_generator = AnchorGenerator(sizes=sizes_tuple, aspect_ratios=ratios_per_level)
+
+    # 3) num_classes 轉換（容忍「含背景」寫法）
+    retina_num_classes = max(1, int(num_classes) - 1) if int(num_classes) > 1 else int(num_classes)
+
+    # 4) 建模（不載入任何預訓練）
     model = torchvision.models.detection.retinanet_resnet50_fpn(
         weights=None, weights_backbone=None,
-        num_classes=num_classes,
-        min_size=_maybe_get(cfg or {}, "model.min_size", min_size),
-        max_size=_maybe_get(cfg or {}, "model.max_size", max_size),
-        image_mean=list(_maybe_get(cfg or {}, "model.image_mean", image_mean)),
-        image_std=list(_maybe_get(cfg or {}, "model.image_std", image_std)),
+        num_classes=retina_num_classes,
+        anchor_generator=anchor_generator,
+        min_size=min_size, max_size=max_size,
+        image_mean=image_mean, image_std=image_std,
     )
     return model
 
@@ -257,10 +272,9 @@ def get_retinanet_r50_fpn(num_classes=2, *, min_size=None, max_size=None,
 def get_ssdlite_mbv3(num_classes=2, *,
                      image_mean=(0.0,0.0,0.0), image_std=(1.0,1.0,1.0),
                      cfg: Optional[Dict[str, Any]] = None):
-    # 超輕量一路徑（推論快、參數小）；輸入尺寸固定 320
     model = torchvision.models.detection.ssdlite320_mobilenet_v3_large(
         weights=None, weights_backbone=None,
-        num_classes=num_classes,
+        num_classes=max(1, int(num_classes) - 1) if int(num_classes) > 1 else int(num_classes),
         image_mean=list(_maybe_get(cfg or {}, "model.image_mean", image_mean)),
         image_std=list(_maybe_get(cfg or {}, "model.image_std", image_std)),
     )
@@ -287,19 +301,20 @@ def build_detector_from_cfg(cfg: Dict[str, Any]):
     image_std  = tuple(_maybe_get(cfg or {}, "model.image_std",  (1.0,1.0,1.0)))
 
     builder = _DET_BUILDERS.get(name, get_fasterrcnn_r50_fpn)
-    if builder is get_fasterrcnn_r50_fpn:
-        # 保持你原本的 r50_fpn 參數風格（含 anchors 等）
+
+    # RetinaNet/SSDlite 允許 YAML 使用「含背景」習慣寫法 → 內部轉換
+    if builder in (get_retinanet_r50_fpn, get_ssdlite_mbv3):
         return builder(
-            num_classes=num_classes,
+            num_classes=num_classes,  # 內部會自動轉換
             min_size=min_size, max_size=max_size,
             image_mean=image_mean, image_std=image_std,
             cfg=cfg
         )
-    else:
-        # 其它模型路線依各自 API 建構（盡量沿用 mean/std/size）
-        return builder(
-            num_classes=num_classes,
-            min_size=min_size, max_size=max_size,
-            image_mean=image_mean, image_std=image_std,
-            cfg=cfg
-        )
+
+    # 其它模型路線依各自 API 建構（盡量沿用 mean/std/size）
+    return builder(
+        num_classes=num_classes,
+        min_size=min_size, max_size=max_size,
+        image_mean=image_mean, image_std=image_std,
+        cfg=cfg
+    )
