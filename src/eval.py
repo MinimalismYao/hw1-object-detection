@@ -21,7 +21,7 @@ from tqdm import tqdm
 import numpy as np
 
 from config import load_cfg
-from modelv4 import get_fasterrcnn_r50_fpn  # 與 `python src/eval.py` 相容的匯入方式
+from modelv6 import get_fasterrcnn_r50_fpn  # 與 `python src/eval.py` 相容的匯入方式
 
 # ========= 可在這裡快速覆寫設定（可留空） =========
 CFG_PATH = "experiments/configs/v5.yaml"

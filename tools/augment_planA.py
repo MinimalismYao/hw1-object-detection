@@ -10,7 +10,7 @@ Plan A: 加倍資料量（每張原圖新增 1 張）
 """
 
 from pathlib import Path
-import io, os, re, shutil, random
+import io, re, shutil, random
 from collections import defaultdict
 from typing import List, Tuple, Dict
 
@@ -33,6 +33,8 @@ BRIGHTNESS_GAIN = 0.20
 CONTRAST_GAIN   = 0.20
 SATURATION_GAIN = 0.20
 HUE_GAIN        = 0.02          # 0~0.5
+
+ID_PAD = 8                      # ← 檔名位數：你的資料是 8 碼（例：00000001.jpg）
 # =======================
 
 _num_re = re.compile(r"(\d+)")
@@ -118,7 +120,8 @@ def main():
         boxes_by_fid[fid].append((x, y, w, h))
 
     # 推測影像副檔名：以現有最小 id 的檔案為準
-    existing_files = sorted([p for p in IMG_DIR.iterdir() if p.is_file()], key=lambda p: _extract_number(p.stem) or 0)
+    existing_files = sorted([p for p in IMG_DIR.iterdir() if p.is_file()],
+                            key=lambda p: _extract_number(p.stem) or 0)
     assert existing_files, f"no images in {IMG_DIR}"
     ext = existing_files[0].suffix  # 如 .jpg/.png
 
@@ -133,9 +136,11 @@ def main():
         print(f"[INFO] backup created: {bak}")
 
     new_gt_lines: List[str] = []
+    new_images = 0
+
     # 逐張影像
     for fid in sorted(boxes_by_fid.keys()):
-        img_path = IMG_DIR / f"{fid:06d}{ext}"
+        img_path = IMG_DIR / f"{fid:0{ID_PAD}d}{ext}"
         if not img_path.exists():
             print(f"[WARN] image not found for frame {fid}: {img_path}")
             continue
@@ -165,9 +170,9 @@ def main():
             aug = _apply_appearance_aug(aug)
 
             # 產生新檔名與 id
-            while (IMG_DIR / f"{next_id:06d}{ext}").exists():
+            while (IMG_DIR / f"{next_id:0{ID_PAD}d}{ext}").exists():
                 next_id += 1
-            out_path = IMG_DIR / f"{next_id:06d}{ext}"
+            out_path = IMG_DIR / f"{next_id:0{ID_PAD}d}{ext}"
             aug.save(out_path)
 
             # 同步寫入標註（frame_id 改為 next_id）
@@ -175,13 +180,14 @@ def main():
                 new_gt_lines.append(f"{next_id},{x:.1f},{y:.1f},{bw:.1f},{bh:.1f}")
 
             next_id += 1
+            new_images += 1
 
     # 追加到 gt_train.txt
     with GT_FILE.open("a", encoding="utf-8") as f:
         for ln in new_gt_lines:
             f.write(ln + "\n")
 
-    print(f"[DONE] added {len(new_gt_lines)} gt lines for {len(new_gt_lines) and len(new_gt_lines) // len(src_boxes) or 0} new images.")
+    print(f"[DONE] added {new_images} new images and {len(new_gt_lines)} gt lines.")
     print(f"[NOTE] originals are untouched. Updated GT: {GT_FILE}")
 
 if __name__ == "__main__":
