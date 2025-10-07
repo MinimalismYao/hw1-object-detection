@@ -5,10 +5,10 @@ src/eval.py
 ---------------------------------
 單類別（class=0=pig）COCO 風格指標（AP/AR）並以 COCO 官方摘要格式輸出。
 只讀 data/val/img 與 data/val/gt_val.txt。
-做法優化：
-- 收集階段就先對每張影像只保留 Top-K（與 COCO maxDets 對齊）
-- 每個主要階段印出進度（flush=True）
+
+特性：
 - ✅ 與訓練「同一份 YAML」建模（anchors/min-max-size/NMS 等完全一致）
+- ✅ 收集階段即做 Top-K（與 COCO maxDets 對齊）
 - ✅ 產出更完整的 details JSON（每個 IoU 的 AP/AR 陣列 + S/M/L 區間）
 """
 
@@ -23,16 +23,45 @@ from tqdm import tqdm
 import numpy as np
 
 from config import load_cfg
-from modelv6 import get_fasterrcnn_r50_fpn  # 與 `python src/eval.py` 相容的匯入方式
 
-# ========= 可在這裡快速覆寫設定（可留空） =========
-CFG_PATH = "experiments/configs/v6.yaml"
+# ========= 可以在這裡快速覆寫設定（可留空） =========
+CFG_PATH = "experiments/configs/v7.yaml"
 OVERRIDES = [
-    "checkpoint.save_full_path=experiments/logs/fasterrcnn_v6/fasterrcnn_v6_best.pth",
-    # "project.run_name=fasterrcnn_v6_eval",  # 只影響輸出檔名
+    # 範例：
+    # "checkpoint.save_full_path=experiments/logs/fasterrcnn_v7/fasterrcnn_v7_best.pth",
+    # "project.run_name=fasterrcnn_v7_eval",
 ]
 # =================================================
 
+
+# ---------- 通用模型工廠（v7 優先、v6 後備） ----------
+def _import_builder():
+    try:
+        from modelv7 import build_detector_from_cfg as _b
+        return _b
+    except Exception:
+        pass
+    try:
+        from modelv6 import build_detector_from_cfg as _b
+        return _b
+    except Exception:
+        return None
+
+_BUILD_DET = _import_builder()
+
+def build_detector_from_cfg(cfg):
+    assert _BUILD_DET is not None, "找不到模型工廠：請確認 src/modelv7.py（或 modelv6.py）存在。"
+    return _BUILD_DET(cfg)
+
+
+# ---------- 小工具 ----------
+def _cfg_get(d, path, default=None):
+    cur = d
+    for k in path.split("."):
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
 
 def resize_keep_max_side(pil_img: Image.Image, max_side: int) -> Image.Image:
     w, h = pil_img.size
@@ -41,7 +70,6 @@ def resize_keep_max_side(pil_img: Image.Image, max_side: int) -> Image.Image:
     scale = float(max_side) / max(w, h)
     new_w, new_h = int(round(w * scale)), int(round(h * scale))
     return pil_img.resize((new_w, new_h), resample=Image.BILINEAR)
-
 
 def load_gt(gt_txt_path: Path):
     gt_map = defaultdict(list)
@@ -54,11 +82,12 @@ def load_gt(gt_txt_path: Path):
             if len(parts) < 5:
                 continue
             fid = int(parts[0]); x, y, w, h = map(float, parts[1:5])
+            if w <= 0 or h <= 0:
+                continue
             gt_map[fid].append([x, y, w, h])
     for k in list(gt_map.keys()):
         gt_map[k] = torch.tensor(gt_map[k], dtype=torch.float32)
     return gt_map
-
 
 def list_val_images(img_dir: Path):
     exts = (".jpg", ".jpeg", ".png", ".bmp", ".JPG", ".JPEG", ".PNG", ".BMP")
@@ -71,13 +100,11 @@ def list_val_images(img_dir: Path):
     items.sort(key=lambda t: t[0])
     return items
 
-
 def xywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
     out = boxes.clone()
     out[:, 2] = boxes[:, 0] + boxes[:, 2]
     out[:, 3] = boxes[:, 1] + boxes[:, 3]
     return out
-
 
 def compute_ap(rec, prec):
     mrec = np.concatenate(([0.0], rec, [1.0]))
@@ -86,7 +113,6 @@ def compute_ap(rec, prec):
         mpre[i - 1] = np.maximum(mpre[i - 1], mpre[i])
     idx = np.where(mrec[1:] != mrec[:-1])[0]
     return np.sum((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1])
-
 
 def eval_split(det_records, gt_map_xywh, image_ids, iou_thr, max_dets=None, area_rng=None, return_curve=False):
     # 篩 det by image + top-k
@@ -158,24 +184,26 @@ def eval_split(det_records, gt_map_xywh, image_ids, iou_thr, max_dets=None, area
     return ap, ar, int(num_gt_total)
 
 
+# ---------- 主程式 ----------
 @torch.inference_mode()
 def main():
     # 讀設定
     project_root = Path(__file__).resolve().parents[1]
     cfg = load_cfg(str(project_root / CFG_PATH), overrides=OVERRIDES)
 
-    img_dir = Path(cfg["data"].get("val_img_dir", "data/val/img"))
-    gt_txt  = Path(cfg["data"].get("val_gt", "data/val/gt_val.txt"))
+    img_dir = Path(_cfg_get(cfg, "data.val_img_dir", "data/val/img"))
+    gt_txt  = Path(_cfg_get(cfg, "data.val_gt", "data/val/gt_val.txt"))
     assert img_dir.exists(), f"找不到影像資料夾：{img_dir}"
     assert gt_txt.exists(), f"找不到標註檔：{gt_txt}"
 
-    iou_list = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
-    max_side = int(cfg["augment"]["max_side"])
-    score_thr = float(cfg["infer"]["score_thr"])
-    max_dets_cfg = int(cfg["eval"].get("max_det", 100))
+    iou_list = _cfg_get(cfg, "eval.iou_thresholds",
+                        [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95])
+    max_side  = int(_cfg_get(cfg, "augment.max_side", 1280))
+    score_thr = float(_cfg_get(cfg, "infer.score_thr", 0.05))
+    max_dets_cfg = int(_cfg_get(cfg, "eval.max_det", 300))
 
-    out_txt  = Path(cfg["eval"]["result_txt"])
-    out_json = Path(cfg["eval"]["result_json"])
+    out_txt  = Path(_cfg_get(cfg, "eval.result_txt", "experiments/eval_results/eval_results.txt"))
+    out_json = Path(_cfg_get(cfg, "eval.result_json", "experiments/eval_results/eval_details.json"))
     out_txt.parent.mkdir(parents=True, exist_ok=True)
     out_json.parent.mkdir(parents=True, exist_ok=True)
 
@@ -184,23 +212,18 @@ def main():
     gt_map_xywh = load_gt(gt_txt)
     image_ids = [fid for fid, _ in val_images if fid in gt_map_xywh]
 
-    # 載模型（🔥 重點：用同一份 YAML 建模，anchors/min-max-size/NMS 等全同步）
-    device = torch.device("cuda" if torch.cuda.is_available() and cfg["device"]["cuda"] else "cpu")
-    model = get_fasterrcnn_r50_fpn(
-        num_classes=cfg["model"]["num_classes"],
-        freeze_backbone=cfg["model"]["freeze_backbone"],
-        pretrained_backbone=cfg["model"].get("pretrained_backbone", False),
-        cfg=cfg,  # ← 讓內部以 cfg 覆蓋 anchors / min_size / nms / proposals 等
-    ).to(device)
+    # 建模：與訓練同 YAML（自動匹配 retinanet/fasterrcnn/ssdlite）
+    device = torch.device("cuda" if torch.cuda.is_available() and _cfg_get(cfg, "device.cuda", True) else "cpu")
+    model = build_detector_from_cfg(cfg).to(device)
     model.eval()
 
-    # ✅ 優先使用 save_full_path；否則退回 dir/name
+    # 權重路徑（優先用 save_full_path）
     ckpt_cfg  = cfg["checkpoint"]
     ckpt_path = Path(ckpt_cfg.get("save_full_path") or (Path(ckpt_cfg["dir"]) / ckpt_cfg["name"]))
     print(f"[Eval] Using checkpoint: {ckpt_path}")
     assert ckpt_path.exists(), f"找不到權重檔：{ckpt_path}"
 
-    # 載入（相容舊版 torch，並自動把 fp16 權重轉回 fp32）
+    # 載入權重，容忍 fp16 → fp32
     def _state_to_fp32(state):
         for k, v in list(state.items()):
             if isinstance(v, torch.Tensor) and v.is_floating_point() and v.dtype == torch.float16:
@@ -208,18 +231,24 @@ def main():
         return state
 
     try:
-        state = torch.load(str(ckpt_path), map_location=device, weights_only=True)
+        state = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
     except TypeError:
-        state = torch.load(str(ckpt_path), map_location=device)
-    state = _state_to_fp32(state)
-    model.load_state_dict(state, strict=True)
-    model.eval()
+        state = torch.load(str(ckpt_path), map_location="cpu")
+    model.load_state_dict(_state_to_fp32(state), strict=True)
+    model.to(device).eval()
 
-    # （可選）列印關鍵設定，檢查與訓練一致
-    print(f"[Cfg] rpn_anchor_sizes  = {cfg['model']['rpn_anchor_sizes']}")
-    print(f"[Cfg] rpn_anchor_ratios = {cfg['model']['rpn_anchor_ratios']}")
-    print(f"[Cfg] min/max size       = {cfg['model']['min_size']}/{cfg['model']['max_size']}")
-    print(f"[Cfg] nms/score/dets     = {cfg['infer']['nms_iou']}/{cfg['infer']['score_thr']}/{cfg['eval']['max_det']}")
+    # 列印重要設定，檢查與訓練一致
+    rpn_sizes   = _cfg_get(cfg, "model.rpn_anchor_sizes", None)
+    rpn_ratios  = _cfg_get(cfg, "model.rpn_anchor_ratios", None)
+    ret_sizes   = _cfg_get(cfg, "model.retinanet_anchor_sizes", None)
+    ret_ratios  = _cfg_get(cfg, "model.retinanet_anchor_aspect_ratios", None)
+    print(f"[Cfg] detector          = {_cfg_get(cfg, 'model.detector', 'unknown')}")
+    print(f"[Cfg] min/max size      = {_cfg_get(cfg, 'model.min_size', '?')}/{_cfg_get(cfg, 'model.max_size', '?')}")
+    print(f"[Cfg] score/nms/maxDet  = {score_thr}/{_cfg_get(cfg,'infer.nms_iou', 0.5)}/{max_dets_cfg}")
+    if ret_sizes is not None:
+        print(f"[Cfg] retinanet anchors = sizes:{ret_sizes} ratios:{ret_ratios}")
+    elif rpn_sizes is not None:
+        print(f"[Cfg] rpn anchors       = sizes:{rpn_sizes} ratios:{rpn_ratios}")
 
     print(f"[1/4] Inference on val images ...", flush=True)
     # 收集偵測（每張圖預先限制 Top-K，加速後續評分）
@@ -232,12 +261,11 @@ def main():
         img = resize_keep_max_side(img, max_side=max_side)
         x = to_tensor(img).to(device).unsqueeze(0)
         out = model(x)[0]
+        # torchvision 內部已做 NMS，這裡只做分數過濾與 Top-K
         boxes = out["boxes"].detach().cpu()
         scores = out["scores"].detach().cpu()
-        # 低分過濾
         keep = scores >= score_thr
         boxes = boxes[keep]; scores = scores[keep]
-        # 只留 Top-K（與 COCO maxDets 對齊）
         if scores.numel() > max_dets_cfg:
             topk = min(max_dets_cfg, scores.numel())
             vals, idxs = torch.topk(scores, k=topk)
@@ -308,10 +336,6 @@ def main():
     lines.append("- recall    的維度為 [IoU x category x area x maxDets]（每個 IoU 的最大可達召回）。")
     lines.append("- 詳細陣列請見 *_details.json（可用來畫曲線與分析 S/M/L）。")
 
-    out_txt = Path(cfg["eval"]["result_txt"])
-    out_json = Path(cfg["eval"]["result_json"])
-    out_txt.parent.mkdir(parents=True, exist_ok=True)
-    out_json.parent.mkdir(parents=True, exist_ok=True)
     out_txt.write_text("\n".join(lines), encoding="utf-8")
 
     # 輸出（細節 JSON：每個 IoU 的 AP/AR 列表 + 面積分段）
@@ -338,13 +362,17 @@ def main():
             "AR@100_L":   ars_100_l,
         },
         "cfg_refs": {
-            "rpn_anchor_sizes": cfg["model"]["rpn_anchor_sizes"],
-            "rpn_anchor_ratios": cfg["model"]["rpn_anchor_ratios"],
-            "min_size": cfg["model"]["min_size"],
-            "max_size": cfg["model"]["max_size"],
-            "box_score_thresh": cfg["infer"]["score_thr"],
-            "box_nms_thresh": cfg["infer"]["nms_iou"],
+            "detector": _cfg_get(cfg, "model.detector"),
+            "min_size": _cfg_get(cfg, "model.min_size"),
+            "max_size": _cfg_get(cfg, "model.max_size"),
+            "box_score_thresh": _cfg_get(cfg, "infer.score_thr"),
+            "box_nms_thresh": _cfg_get(cfg, "infer.nms_iou"),
             "max_dets_eval": max_dets_cfg,
+            # 兩種 anchors 欄位擇一存在
+            "rpn_anchor_sizes":  _cfg_get(cfg, "model.rpn_anchor_sizes"),
+            "rpn_anchor_ratios": _cfg_get(cfg, "model.rpn_anchor_ratios"),
+            "retinanet_anchor_sizes": _cfg_get(cfg, "model.retinanet_anchor_sizes"),
+            "retinanet_anchor_aspect_ratios": _cfg_get(cfg, "model.retinanet_anchor_aspect_ratios"),
         },
     }
     with open(out_json, "w", encoding="utf-8") as f:

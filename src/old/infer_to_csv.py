@@ -25,7 +25,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from config import load_cfg
-from modelv6 import get_fasterrcnn_r50_fpn  # 與 train/eval 一致
+from src.modelv6 import get_fasterrcnn_r50_fpn  # 與 train/eval 一致
 
 # ========= 覆寫設定（可留空） =========
 CFG_PATH = "experiments/configs/v6.yaml"

@@ -1,21 +1,14 @@
 # =========================
-# hw1_od · retinanet_v7 (Small-object friendly, Stable on 3080/1650)
-# 重點：一階段 RetinaNet + 小物件長條 anchors + Soft-NMS + Tiling 推論
-# - 輸入維持 1280；若想衝更高可再測 1536（見底部註解）
-# - RetinaNet 無 RPN/ROI，VRAM 較省；Focal Loss 對密集場景更穩
-# - 自訂 anchors（小 + 長條）對俯視豬群特別有效
-# - 推論端加入 Tiling（2×2 或 3×2 覆蓋）+ Soft-NMS + TopK
-# =========================
-#retinanet_r50_fpn（one-stage, 密集偵測）
-#Focal Loss 抑制易樣本，通常對小物件/密集場景更友善；推論較快、記憶體較省（無 RoI 阶段），調到對就常見到小物件 AP 明顯回升。
+# hw1_od · fasterrcnn_v7 (Small-object oriented, R101 + FPN P2~P6 + Big RoI Head)
+# 重點：更深骨幹（ResNet-101）、更密錨點（min=8）、更大 RoI Head（4FC×1024, pool=14x14）
+# 目的：從「模型能力」端解決 train/val loss ~0.6 的平台、提升小物件召回與定位穩定度
 # =========================
 
 seed: 42
 
 project:
   name: hw1_od
-  seed: 42
-  run_name: retinanet_v7
+  run_name: fasterrcnn_v7
   output_root: experiments/logs
   output_dir: ${project.output_root}/${project.run_name}
 
@@ -26,100 +19,107 @@ data:
   val_img_dir: data/val/img
   val_gt: data/val/gt_val.txt
   test_img_dir: data/test/img
-  num_workers: 8
+  num_workers: 16
   allow_float_bbox: true
   clip_bbox_to_image: true
   drop_invalid_bbox: true
   min_box_wh: [1, 1]
 
 model:
-  # v7：切換為 RetinaNet
-  detector: retinanet_r50_fpn
-  backbone: resnet50
-
-  # 注意：
-  # - 若你的封裝沿用 Faster R-CNN 的「含背景」慣例，就維持 2；
-  # - 若直接用 torchvision.retinanet_resnet50_fpn，官方 API 的 num_classes 是「不含背景」→ 單類別請改 1。
-  num_classes: 2
-
-  pretrained_backbone: false
-  freeze_backbone: false
-
-  # 與前處理對齊（避免 Transform 與 Model 正規化不一致）
+  detector: fasterrcnn_r101_fpn_v7
+  num_classes: 2            # torchvision Faster R-CNN: 含背景 → 單類別時填 2
+  # 影像正規化（需與 augment.normalize_mean_std 對齊）
   image_mean: [0.485, 0.456, 0.406]
   image_std:  [0.229, 0.224, 0.225]
 
-  # 輸入尺寸（穩定：1280）
+  # 解析度對齊（避免二次縮放）
   min_size: 1280
   max_size: 1280
 
-  # ===== RetinaNet Anchors（小物件＋長條）=====
-  # 5 層 FPN 的金字塔基準尺寸（以豬群俯視的長條外觀為主）
-  retinanet_anchor_sizes: [16, 32, 64, 128, 256]
-  retinanet_anchor_aspect_ratios: [1.0, 2.0, 3.0]
+  # FPN / Norm
+  fpn_out_channels: 256
+  use_p6: true              # 產生 P6（C5 上 MaxPool），小物件/大視角更穩
+  norm: "groupnorm32"       # 從零訓練更穩；可選：bn / frozenbn / groupnorm32
 
-  # （可選）Focal Loss 係數微調：gamma 1.5~2.5、alpha 0.25~0.5
-  focal_loss_gamma: 2.0
-  focal_loss_alpha: 0.25
+  # Anchors（小物件友善：min=8、含長條 3.0）
+  rpn_anchor_sizes: [8, 16, 32, 64, 128, 256]
+  rpn_anchor_ratios: [0.5, 1.0, 2.0, 3.0]
+
+  # RPN（多收候選，密集場景用）
+  rpn:
+    batch_size_per_image: 1024
+    positive_fraction: 0.5
+    fg_iou_thresh: 0.6
+    bg_iou_thresh: 0.2
+    pre_nms_top_n_train: 6000
+    post_nms_top_n_train: 3000
+    pre_nms_top_n_test:  3000
+    post_nms_top_n_test: 1500
+    nms_thresh: 0.7
+
+  # RoI / Head（大容量）
+  roi:
+    box_batch_size_per_image: 1024
+    box_positive_fraction: 0.25
+    roi_pool_size: 14
+    head_hidden_dim: 1024
+    head_num_fc: 4
+    bbox_reg_weights: [10.0, 10.0, 5.0, 5.0]   # 小框定位更穩
+    nms_thresh: 0.5
+    detections_per_img: 300
+    score_thresh: 0.0
+
+train:
+  epochs: 3     #72
+  batch_size: 2
+  accumulate: 8                # 有效 batch = 16
+  amp: true
+  cudnn_benchmark: true
+  grad_clip_norm: 1.0
+  model_ema:
+    enabled: true
+    decay: 0.9995
+  # 可選的早停（以防災）
+  early_stop:
+    enabled: true
+    monitor: val_loss
+    mode: min
+    patience: 8
+    save_best: true
+    best_name: ${project.run_name}_best.pth
+
+optimizer:
+  name: sgd
+  lr: 0.012                    # 若 v6 用 0.01，這裡 ×1.2 起跑
+  momentum: 0.9
+  weight_decay: 0.0001
+
+scheduler:
+  name: cosine
+  warmup:
+    type: linear
+    steps: 1500
+    start_factor: 0.1
 
 augment:
-  # ---- 旗標類（RetinaNet 也不建議 mosaic/mixup 在此作業）----
-  mosaic: false
-  mixup: false
-  cutout: false
-  blur_p: 0.0
-  noise_p: 0.0
-  sharpen_p: 0.0
-  affine_p: 0.0
-  perspective_p: 0.0
-
-  # ---- Resize（短邊候選清單，長邊上限）----
-  resize: [768, 960, 1152, 1280]
-  max_side: 1280
-
-  # 其它增強（保持你原設定）
-  flip_p: 0.5
-  hsv: [0.015, 0.70, 0.40]
-  color_jitter_prob: 0.8
-  color_jitter: [0.2, 0.2, 0.2, 0.05]
-  random_crop_prob: 0.20
-  random_crop_min_iou: 0.5
+  # 多尺度訓練（短邊候選），長邊 cap 於 max_side
+  resize_scales: [1024, 1280, 1536]
+  horizontal_flip: true
+  color_jitter: [0.1, 0.1, 0.1, 0.05]   # brightness, contrast, saturation, hue
   gaussian_blur_prob: 0.10
   gaussian_blur_sigma: [0.1, 1.0]
   random_noise_prob: 0.10
 
-  # 注意：與 model.image_mean/std 同步
+  # 目標導向 zoom-in：放大小物件、減少無效背景
+  zoom_in_crop:
+    enabled: true
+    min_side: 640
+    max_side: 896
+    keep_min_area: 0.7
+    min_box_area: 16
+
+  # 與 model.image_mean/std 保持一致
   normalize_mean_std: [[0.485, 0.456, 0.406],[0.229, 0.224, 0.225]]
-
-train:
-  epochs: 36
-  batch_size: 2
-  grad_clip: 10.0
-  amp: true
-  cudnn_benchmark: true
-  accumulate: 8
-
-  # RetinaNet 不需要 FRCNN 的 sampler；若你仍想偏重小物件，可保留你自訂的 DataSampler
-  sampler:
-    enabled: false
-    strategy: "area_weighted"
-    small_quantile: 0.15
-    large_quantile: 0.85
-    small_weight: 2.0
-    large_weight: 1.5
-    normal_weight: 1.0
-    cache_path: ${project.output_dir}/train_sampler_weights.npy
-
-optimizer:
-  type: sgd
-  lr: 0.01
-  momentum: 0.9
-  weight_decay: 5.0e-4
-
-scheduler:
-  type: steplr
-  step_size: 8
-  gamma: 0.1
 
 dataloader:
   pin_memory: true
@@ -135,7 +135,7 @@ sanity_check:
 checkpoint:
   dir: ${project.output_dir}
   name: ${project.run_name}.pth
-  save_last_only: true
+  save_last_only: false
   save_full_path: ${checkpoint.dir}/${checkpoint.name}
 
 logging:
@@ -145,74 +145,21 @@ logging:
 
 eval:
   run_after_train: true
-  iou_thresholds: [0.50,0.55,0.60,0.65,0.70,0.75,0.80,0.85,0.90,0.95]
-  max_det: 300
+  max_dets: 300
+  iou_types: ["bbox"]
+  print_small_ap: true
   save_dir: experiments/eval_results
   result_txt: ${eval.save_dir}/${project.run_name}_results.txt
   result_json: ${eval.save_dir}/${project.run_name}_details.json
   breakdown_by_area: true
   area_ranges:
-    small: [0, 1024]       # 32^2
-    medium: [1024, 9216]   # 96^2
-    large: [9216, 1e10]
+    small:  [0, 1024]        # 32^2
+    medium: [1024, 9216]     # 96^2
+    large:  [9216, 1e10]
 
 infer:
-  # RetinaNet 的分類分數通常較保守，先用 0.05 起手
+  # 與訓練期一致的基本門檻；推論端不做進階花招（先聚焦模型體質）
   score_thr: 0.05
-  nms_iou: 0.6
+  nms_iou: 0.5
+  topk_per_image: 300
   submission_csv: submissions/${project.run_name}_submission.csv
-
-  # ===== 推論強化：Soft-NMS + 面積感知 + TopK + Tiling =====
-  postproc:
-    soft_nms:
-      enabled: true
-      method: "gaussian"
-      sigma: 0.5
-      iou_thresh: 0.6
-      score_thresh: 0.0
-    area_aware_score:
-      enabled: true
-      small_thr: 0.02
-      medium_thr: 0.04
-      large_thr: 0.06
-      small_area: 1024
-      large_area: 9216
-    topk_per_image: 300
-    temperature_scaling:
-      enabled: false
-      T: 1.0
-
-  tiling:
-    enabled: true
-    mode: "grid"
-    tile_size: 1024
-    overlap: 0.15      # 10~15% 推薦
-    pad: 0             # 如需邊緣對齊可設置到 32 的倍數
-    merge_strategy: "nms"  # nms | soft_nms（與上方參數共用）
-
-device:
-  cuda: true
-
-early_stop:
-  enabled: true
-  monitor: val_loss
-  mode: min
-  patience: 5
-  save_best: true
-  best_name: ${project.run_name}_best.pth
-
-# ====== 1536 模式（若你之後想回到 1536，請同時套用以下建議）======
-# model:
-#   min_size: 1536
-#   max_size: 1536
-#   retinanet_anchor_sizes: [16, 32, 64, 128, 256]   # 可維持，或再加一層 512 視 VRAM
-# augment:
-#   resize: [896, 1024, 1200, 1400]
-#   max_side: 1536
-# train:
-#   batch_size: 2
-#   accumulate: 8
-# infer:
-#   tiling:
-#     tile_size: 1280
-#     overlap: 0.15

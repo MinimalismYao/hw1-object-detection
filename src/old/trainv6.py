@@ -24,7 +24,7 @@ from tqdm import tqdm
 
 from dataset import PigsDataset, collate_fn
 from transforms import get_transforms
-from modelv6 import build_detector_from_cfg  # ← 改用模型工廠
+from src.modelv6 import build_detector_from_cfg  # ← 改用模型工廠
 from omegaconf import OmegaConf
 from config import load_cfg
 
@@ -305,7 +305,7 @@ def main():
             # 讓 eval 也走「模型工廠」而不是寫死 R50-FPN：
             # eval.py 內部會呼叫 get_fasterrcnn_r50_fpn(..., cfg=cfg)
             # 我們把它 monkey-patch 成用 build_detector_from_cfg(cfg)
-            from modelv6 import build_detector_from_cfg as _factory_for_eval
+            from src.modelv6 import build_detector_from_cfg as _factory_for_eval
             def _patched_builder(**kwargs):
                 # kwargs 會帶 cfg
                 return _factory_for_eval(kwargs.get("cfg"))
