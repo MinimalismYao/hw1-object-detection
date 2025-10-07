@@ -223,6 +223,27 @@ def train_one_epoch(model, loader, optimizer, device, epoch_idx, total_epochs,
 
 
 @torch.no_grad()
+def debug_one_batch(model, loader, device, detector_name: str = ""):
+    model.train()
+    images, targets = next(iter(loader))
+    images  = [img.to(device, non_blocking=True) for img in images]
+    targets = _targets_to_device([{k: v for k, v in t.items()} for t in targets], device)
+    targets = _remap_labels_for_detector(detector_name, targets)
+
+    # 1) 標籤與框統計
+    import numpy as np
+    all_labels = torch.cat([t["labels"].cpu() for t in targets if "labels" in t and len(t["labels"])>0], dim=0)
+    all_boxes  = torch.cat([t["boxes"].cpu()  for t in targets if "boxes"  in t and len(t["boxes"]) >0], dim=0)
+    x1y1 = all_boxes[:, :2]; x2y2 = all_boxes[:, 2:]
+    wh = (x2y2 - x1y1).clamp(min=0)
+    print(f"[DBG-BATCH] labels uniq={torch.unique(all_labels).tolist()} "
+          f"boxes N={len(all_boxes)}, w/h mean={wh.mean(0).tolist()}, min={wh.min(0).values.tolist()}")
+
+    # 2) 損失細項
+    loss_dict = model(images, targets)
+    comp = {k: float(v.detach().item()) for k, v in loss_dict.items()}
+    print(f"[DBG-BATCH] loss parts = {comp} | sum={sum(comp.values()):.4f}")
+
 def validate_one_epoch(model, loader, device, amp_enabled=False, detector_name: str = ""):
     """注意：torchvision detection 要保持 model.train() 才會回傳 loss。"""
     model.train()
@@ -322,6 +343,9 @@ def main():
         prefetch_factor=int(D.get("prefetch_factor", 2)),
         collate_fn=collate_fn,
     )
+    
+    debug_one_batch(model, loader_train, device, det_name)
+
     loader_val = DataLoader(
         ds_val,
         batch_size=max(1, int(cfg.get("sanity_check", {}).get("batch_size", 2))),

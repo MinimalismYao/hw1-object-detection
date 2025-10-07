@@ -3,9 +3,9 @@
 # hw1_od · fasterrcnn_v7 (R101 + FPN P2~P6 + Big RoI Head)
 # 目標：
 #   - 穩定自然收斂（降低 train/val loss gap）
-#   - 抑制過擬合（正則化 + 凍結 backbone + EMA）
-#   - 提升小物件 AP（anchors 微縮、IoU 門檻提高）
-#   - 控制顯存（1024輸入 + 低 batch + accumulate）
+#   - 抑制過擬合（正則化 + EMA）
+#   - 提升小物件 AP（錨框與 FPN 層級精準對齊）
+#   - 控制顯存（1024輸入 + 小 batch + accumulate）
 # =========================
 
 seed: 42
@@ -40,7 +40,7 @@ model:
   detector: fasterrcnn_r101_fpn_v7
   num_classes: 2
 
-  # Normalization：改為 FrozenBN，防止小 batch 統計偏移
+  # Normalization：FrozenBN（或可改 groupnorm32）
   norm: "frozenbn"
 
   # 輸入尺度（固定 1024，可保留小物件細節但穩定顯存）
@@ -50,39 +50,34 @@ model:
   image_mean: [0.485, 0.456, 0.406]
   image_std:  [0.229, 0.224, 0.225]
 
-  # FPN：P2~P6，強化小物件特徵層
+  # FPN：P2~P6
   fpn_out_channels: 256
   use_p6: true
 
-  # Anchors：針對小物件微縮
-  rpn_anchor_sizes:  [8, 12, 16, 24, 32, 48]
-  rpn_anchor_ratios: [0.5, 1.0, 2.0, 3.0]
+  # ⚠️ Anchors：改為「逐層主尺度」與 FPN 對齊（P2..P6）
+  #    請勿再使用平鋪 rpn_anchor_sizes 覆蓋，避免每層都拿到錯誤尺度。
+  rpn_anchor_sizes_per_level: [[32],[64],[96],[128],[192]]
+  rpn_anchor_ratios: [0.5, 1.0, 2.0]
 
-  # RPN：保守設定，減少假陽性提案
+  # RPN：穩健 baseline
   rpn:
-    batch_size_per_image: 256       # ← 降低過擬合風險
-    positive_fraction: 0.25
-    fg_iou_thresh: 0.6
-    bg_iou_thresh: 0.2
-    pre_nms_top_n_train: 3000
-    post_nms_top_n_train: 1500
-    pre_nms_top_n_test:  2000
+    fg_iou_thresh: 0.7
+    bg_iou_thresh: 0.3
+    batch_size_per_image: 256
+    positive_fraction: 0.5
+    pre_nms_top_n_train: 2000
+    post_nms_top_n_train: 1000
+    pre_nms_top_n_test:  1000
     post_nms_top_n_test: 1000
     nms_thresh: 0.7
 
-  # RoI Head：保守取樣 + 適中正樣比例
+  # RoI Head：保守取樣 + 權重為 1（避免回歸爆）
   roi:
-    roi_pool_size: 11
-    head_hidden_dim: 1024
-    head_num_fc: 4
-    bbox_reg_weights: [1.0, 1.0, 1.0, 1.0]
-    nms_thresh: 0.5
-    detections_per_img: 150
-    score_thresh: 0.0
+    fg_iou_thresh: 0.5
+    bg_iou_thresh: 0.5
     box_batch_size_per_image: 512
-    box_positive_fraction: 0.33
-    fg_iou_thresh: 0.6      # ← 提高，確保正樣本品質
-    bg_iou_thresh: 0.1
+    box_positive_fraction: 0.25
+    bbox_reg_weights: [1.0, 1.0, 1.0, 1.0]
 
 # ---------------------------------------------------------
 # Augmentation（保守增強，避免 val 分佈偏移）
@@ -94,33 +89,33 @@ augment:
   color_jitter_prob: 0.3
   color_jitter: [0.1, 0.1, 0.1, 0.05]
   hsv: [0.02, 0.5, 0.3]
-  mosaic: false             # 禁用強增強（避免 bbox 失真）
+  mosaic: false
 
 # ---------------------------------------------------------
 # Train
 # ---------------------------------------------------------
 train:
-  epochs: 54                # 延長訓練，允許 cosine 慢收斂
-  batch_size: 2             # 小 batch 保守顯存
-  accumulate: 4             # 等效大 batch（穩定梯度）
+  epochs: 54
+  batch_size: 2
+  accumulate: 4
   amp: false
   cudnn_benchmark: true
   grad_clip: 1.0
 
-  # Backbone 凍結：前 5 epoch 不更新主幹，防止早期震盪
+  # 先不凍結，對照收斂與速度（之後要再開可改 >0）
   freeze_backbone_epochs: 5
 
-  # EMA：平滑權重，驗證更穩
+  # EMA：平滑權重
   model_ema:
     enabled: true
     decay: 0.9995
 
-  # Early Stop：防止過擬合擴大
+  # Early Stop
   early_stop:
     enabled: true
     monitor: val_loss
     mode: min
-    patience: 6             # 提前終止
+    patience: 6
     save_best: true
     best_name: ${project.run_name}_best.pth
 
@@ -128,8 +123,8 @@ train:
 # Optimizer（小步長，穩定泛化）
 # ---------------------------------------------------------
 optimizer:
-  type: adamw              # ← AdamW 通常在小 batch 下更穩
-  lr: 0.0003                # ← LR 降 3 倍避免過擬合
+  type: adamw
+  lr: 0.0003
   weight_decay: 0.0008
   betas: [0.9, 0.999]
 
@@ -159,7 +154,7 @@ dataloader:
 sanity_check:
   enabled: true
   batch_size: 1
-  max_side: 640
+  max_side: 1024
 
 # ---------------------------------------------------------
 # Checkpoint
