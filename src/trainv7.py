@@ -260,30 +260,40 @@ def main():
     if cfg["sanity_check"]["enabled"]:
         quick_sanity_check(model, device, cfg, det_name)
 
+    # ---- 安全取得 augment 參數（有就用，沒有就用預設）----
+    A = cfg.get("augment", {}) or {}
+    aug_max_side = int(
+        A.get("max_side")
+        or cfg.get("model", {}).get("max_size")
+        or cfg.get("model", {}).get("min_size")
+        or 1280
+    )
+    flip_p            = float(A.get("flip_p", 0.5))
+    hsv               = A.get("hsv", [0.015, 0.70, 0.40])
+    resize_scales     = A.get("resize", [896, 1024, 1200, 1400])
+    mosaic            = bool(A.get("mosaic", False))
+    color_jitter_prob = float(A.get("color_jitter_prob", 0.0))
+    color_jitter      = A.get("color_jitter", [0.0, 0.0, 0.0, 0.0])
+
     # 5) 資料集 & 轉換
-    # 注意：下列引數需與你的 transforms.py 簽名相容（保持你原本使用法）
     train_tfms = get_transforms(
         train=True,
-        max_side=cfg["augment"]["max_side"],
-        flip_p=cfg["augment"]["horizontal_flip"] if "horizontal_flip" in cfg["augment"] else cfg["augment"]["flip_p"],
-        hsv=cfg["augment"].get("hsv", [0.0, 0.0, 0.0]),
-        resize=cfg["augment"].get("resize_scales", cfg["augment"].get("resize", [1280])),
-        mosaic=cfg["augment"].get("mosaic", False),
+        max_side=aug_max_side,
+        flip_p=flip_p,
+        hsv=hsv,
+        resize=resize_scales,
+        mosaic=mosaic,
         min_box_size=float(cfg["data"]["min_box_wh"][0]),
-        color_jitter_prob=cfg["augment"].get("color_jitter_prob", 0.0),
-        color_jitter=cfg["augment"].get("color_jitter", [0,0,0,0]),
-        zoom_in_cfg=cfg["augment"].get("zoom_in_crop", {"enabled": False}),
-        gaussian_blur_prob=cfg["augment"].get("gaussian_blur_prob", 0.0),
-        gaussian_blur_sigma=cfg["augment"].get("gaussian_blur_sigma", [0.1, 1.0]),
-        random_noise_prob=cfg["augment"].get("random_noise_prob", 0.0),
-        normalize_mean_std=cfg["augment"].get("normalize_mean_std", [[0.485,0.456,0.406],[0.229,0.224,0.225]])
+        color_jitter_prob=color_jitter_prob,
+        color_jitter=color_jitter,
     )
     val_tfms = get_transforms(
         train=False,
-        max_side=cfg["augment"]["max_side"],
+        max_side=aug_max_side,
         min_box_size=float(cfg["data"]["min_box_wh"][0]),
-        normalize_mean_std=cfg["augment"].get("normalize_mean_std", [[0.485,0.456,0.406],[0.229,0.224,0.225]])
     )
+
+
 
     ds_train = PigsDataset(cfg["data"]["train_img_dir"], cfg["data"]["train_gt"], transforms=train_tfms)
     ds_val   = PigsDataset(cfg["data"]["val_img_dir"],   cfg["data"]["val_gt"],   transforms=val_tfms)
@@ -433,22 +443,37 @@ def main():
             import importlib
             eval_mod = importlib.import_module("eval")
 
-            # ---- 通用接管 ----
+            # ---- 通用接管（兩手準備）----
+            # 目的：讓 eval.py 用「同一份 cfg + 這次訓練出的 checkpoint」
             from modelv7 import build_detector_from_cfg as _factory_for_eval
-            def _patched_builder(**kwargs):
-                cfg_in = kwargs.get("cfg")
-                # 允許 eval 直接呼叫不帶參數
+
+            def _patched_builder(*args, **kwargs):
+                """
+                允許以下多種呼叫形式：
+                - build_detector_from_cfg(cfg)
+                - build_detector_from_cfg(cfg=xxx)
+                - get_fasterrcnn_r50_fpn(cfg=xxx)  # 舊版 eval 寫法
+                若未傳 cfg，則預設使用訓練時的 cfg（同一份 YAML 解析後字典）。
+                """
+                cfg_in = None
+                # 位置參數 → 第一個若像 dict 視為 cfg
+                if len(args) > 0 and isinstance(args[0], (dict,)):
+                    cfg_in = args[0]
+                # 關鍵字參數優先
+                cfg_in = kwargs.get("cfg", cfg_in)
                 return _factory_for_eval(cfg_in or cfg)
 
-            # 若 eval.py 有 get_fasterrcnn_r50_fpn，改它指向 build_detector_from_cfg
+            # 1) 若 eval.py 有 get_fasterrcnn_r50_fpn，改它指向 patched builder（向下相容）
             if hasattr(eval_mod, "get_fasterrcnn_r50_fpn"):
                 setattr(eval_mod, "get_fasterrcnn_r50_fpn", _patched_builder)
+            # 2) 也直接塞一個 build_detector_from_cfg，讓 eval.py 直接呼叫
             setattr(eval_mod, "build_detector_from_cfg", _patched_builder)
 
             # 指定 eval 讀同一份 YAML，並覆寫 checkpoint 路徑
             rel_cfg_path = str(cfg_path.relative_to(project_root))
             setattr(eval_mod, "CFG_PATH", rel_cfg_path)
             setattr(eval_mod, "OVERRIDES", [f"checkpoint.save_full_path={ckpt_use}"])
+
 
             print("[Post-Eval] Running eval.main() ...")
             eval_mod.main()

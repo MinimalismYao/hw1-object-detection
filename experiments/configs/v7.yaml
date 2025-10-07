@@ -70,7 +70,7 @@ model:
     score_thresh: 0.0
 
 train:
-  epochs: 3     #72
+  epochs: 1     #72
   batch_size: 2
   accumulate: 8                # 有效 batch = 16
   amp: true
@@ -109,6 +109,7 @@ augment:
   gaussian_blur_prob: 0.10
   gaussian_blur_sigma: [0.1, 1.0]
   random_noise_prob: 0.10
+  max_side: 1536
 
   # 目標導向 zoom-in：放大小物件、減少無效背景
   zoom_in_crop:
