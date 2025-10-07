@@ -37,13 +37,13 @@ data:
 # Model
 # ---------------------------------------------------------
 model:
-  detector: fasterrcnn_r101_fpn_v7
+  detector: fasterrcnn_r101_fpn_v7   # 名稱保留，工廠會組裝 R50-FPN（無預訓練）
   num_classes: 2
 
-  # Normalization：FrozenBN（或可改 groupnorm32）
+  # Normalization：FrozenBN（小 batch 穩）
   norm: "frozenbn"
 
-  # 輸入尺度（固定 1024，可保留小物件細節但穩定顯存）
+  # 輸入尺度（固定 1024）
   min_size: 1024
   max_size: 1024
 
@@ -54,15 +54,14 @@ model:
   fpn_out_channels: 256
   use_p6: true
 
-  # ⚠️ Anchors：改為「逐層主尺度」與 FPN 對齊（P2..P6）
-  #    請勿再使用平鋪 rpn_anchor_sizes 覆蓋，避免每層都拿到錯誤尺度。
-  rpn_anchor_sizes_per_level: [[32],[64],[96],[128],[192]]
+  # Anchors：逐層主尺度（P2..P6），請勿再用平鋪 rpn_anchor_sizes 覆蓋
+  rpn_anchor_sizes_per_level: [[16],[32],[64],[96],[128]]
   rpn_anchor_ratios: [0.5, 1.0, 2.0]
 
-  # RPN：穩健 baseline
+  # RPN：起跑更寬鬆，讓正樣本先進來
   rpn:
-    fg_iou_thresh: 0.7
-    bg_iou_thresh: 0.3
+    fg_iou_thresh: 0.5
+    bg_iou_thresh: 0.0
     batch_size_per_image: 256
     positive_fraction: 0.5
     pre_nms_top_n_train: 2000
@@ -86,8 +85,8 @@ augment:
   resize: [896, 1024]
   max_side: 1024
   flip_p: 0.5
-  color_jitter_prob: 0.3
-  color_jitter: [0.1, 0.1, 0.1, 0.05]
+  color_jitter_prob: 0.6
+  color_jitter: [0.2, 0.1, 0.1, 0.05]
   hsv: [0.02, 0.5, 0.3]
   mosaic: false
 
@@ -98,17 +97,17 @@ train:
   epochs: 54
   batch_size: 2
   accumulate: 4
-  amp: false
+  amp: false                # 顯存許可可改 true 加速
   cudnn_benchmark: true
   grad_clip: 1.0
 
-  # 先不凍結，對照收斂與速度（之後要再開可改 >0）
+  # 凍結：前 5 個 epoch 凍結 backbone，之後自動解凍（若收斂慢可改 0）
   freeze_backbone_epochs: 5
 
-  # EMA：平滑權重
+  # EMA：平滑權重（過擬合時更穩）
   model_ema:
     enabled: true
-    decay: 0.9995
+    decay: 0.9998
 
   # Early Stop
   early_stop:
@@ -117,15 +116,15 @@ train:
     mode: min
     patience: 6
     save_best: true
-    best_name: ${project.run_name}_best.pth
+    best_name: ${project.run_name}_best.pth   # ← 修掉多餘的 "}"
 
 # ---------------------------------------------------------
 # Optimizer（小步長，穩定泛化）
 # ---------------------------------------------------------
 optimizer:
   type: adamw
-  lr: 0.0003
-  weight_decay: 0.0008
+  lr: 0.0001
+  weight_decay: 0.0015
   betas: [0.9, 0.999]
 
 # ---------------------------------------------------------
@@ -149,7 +148,7 @@ dataloader:
   shuffle: true
 
 # ---------------------------------------------------------
-# Sanity Check
+# Sanity Check（與訓練同尺度，避免初始化誤判）
 # ---------------------------------------------------------
 sanity_check:
   enabled: true

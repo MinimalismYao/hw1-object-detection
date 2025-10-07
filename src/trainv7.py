@@ -6,8 +6,8 @@ trainv7.py — YAML-driven detector training (clean & safe)
 
 設計原則：
 - 不用 CLI；所有參數來自 YAML，必要覆寫集中在檔頭 OVERRIDES。
-- 功能：AMP（PyTorch 2.x 新寫法）、Cosine+Warmup 或 StepLR、EMA、Early Stop、
-        凍結/解凍 backbone、NaN/Inf 防呆、驗證列印 loss 組成（可定位爆點）。
+- 功能：AMP（PyTorch 2.x）、Cosine+Warmup 或 StepLR、EMA、Early Stop、
+        凍結/解凍 backbone、NaN/Inf 防呆、可選 DBG 首批次檢查、異常批次旁路（skip-OOD）。
 - 與 torchvision detection 相容：val 階段維持 model.train() 以回傳 loss。
 """
 
@@ -162,14 +162,21 @@ def quick_sanity_check(model, device, cfg: Dict[str, Any], detector_name: str):
 # ---------------- Train / Val ----------------
 def train_one_epoch(model, loader, optimizer, device, epoch_idx, total_epochs,
                     grad_clip=None, amp_enabled=False, scaler: GradScaler=None, scheduler_iter=None, accumulate=1,
-                    print_interval=10, ema: ModelEMA = None, detector_name: str = ""):
+                    print_interval=10, ema: ModelEMA = None, detector_name: str = "",
+                    skip_cfg: Dict[str, Any] = None):
     model.train()
     loss_smooth = SmoothedValue()
     pbar = tqdm(loader, total=len(loader), ncols=120, desc=f"Epoch {epoch_idx+1}/{total_epochs}")
 
     optimizer.zero_grad(set_to_none=True)
-
     total_loss, steps = 0.0, 0
+
+    # 旁路設定
+    skip_enabled = bool((skip_cfg or {}).get("enabled", True))
+    thr_rpn_reg = float((skip_cfg or {}).get("rpn_box_reg_thresh", 200.0))
+    thr_roi_reg = float((skip_cfg or {}).get("box_reg_thresh", 100.0))
+    skip_log_every = int((skip_cfg or {}).get("log_every", 50))
+
     for step, (images, targets) in enumerate(pbar, 1):
         images  = [img.to(device, non_blocking=True) for img in images]
         targets = _targets_to_device([{k: v for k, v in t.items()} for t in targets], device)
@@ -186,6 +193,17 @@ def train_one_epoch(model, loader, optimizer, device, epoch_idx, total_epochs,
             print(f"\n[NaN/Inf DETECTED] epoch={epoch_idx+1} step={step} "
                   f"loss={loss_val} parts={comp} lr={optimizer.param_groups[0]['lr']:.3e}")
             raise RuntimeError("Loss became NaN/Inf. Check LR/AMP/labels/boxes.")
+
+        # 異常批次旁路（skip-OOD）
+        if skip_enabled:
+            comp = {k: float(v.detach().item()) for k, v in loss_dict.items()}
+            too_large = (comp.get("loss_rpn_box_reg", 0.0) > thr_rpn_reg) or (comp.get("loss_box_reg", 0.0) > thr_roi_reg)
+            if too_large:
+                if (step % max(1, skip_log_every)) == 0:
+                    print(f"[SKIP-OOD] epoch={epoch_idx+1} step={step} parts={comp}")
+                optimizer.zero_grad(set_to_none=True)
+                del loss_dict, loss, images, targets
+                continue
 
         loss_scaled = loss / max(1, accumulate)
         if amp_enabled and scaler is not None and device.type == "cuda":
@@ -231,7 +249,6 @@ def debug_one_batch(model, loader, device, detector_name: str = ""):
     targets = _remap_labels_for_detector(detector_name, targets)
 
     # 1) 標籤與框統計
-    import numpy as np
     all_labels = torch.cat([t["labels"].cpu() for t in targets if "labels" in t and len(t["labels"])>0], dim=0)
     all_boxes  = torch.cat([t["boxes"].cpu()  for t in targets if "boxes"  in t and len(t["boxes"]) >0], dim=0)
     x1y1 = all_boxes[:, :2]; x2y2 = all_boxes[:, 2:]
@@ -243,6 +260,7 @@ def debug_one_batch(model, loader, device, detector_name: str = ""):
     loss_dict = model(images, targets)
     comp = {k: float(v.detach().item()) for k, v in loss_dict.items()}
     print(f"[DBG-BATCH] loss parts = {comp} | sum={sum(comp.values()):.4f}")
+
 
 def validate_one_epoch(model, loader, device, amp_enabled=False, detector_name: str = ""):
     """注意：torchvision detection 要保持 model.train() 才會回傳 loss。"""
@@ -343,8 +361,10 @@ def main():
         prefetch_factor=int(D.get("prefetch_factor", 2)),
         collate_fn=collate_fn,
     )
-    
-    debug_one_batch(model, loader_train, device, det_name)
+
+    # 可選 DBG 首批次
+    if bool(cfg.get("train", {}).get("debug_first_batch", False)):
+        debug_one_batch(model, loader_train, device, det_name)
 
     loader_val = DataLoader(
         ds_val,
@@ -357,7 +377,16 @@ def main():
         collate_fn=collate_fn,
     )
 
-    # Optimizer
+    # === 先凍結再建 Optimizer（關鍵順序） ===
+    T = cfg.get("train", {}) or {}
+    freeze_epochs = int(T.get("freeze_backbone_epochs", 0))
+    if freeze_epochs > 0:
+        if _set_backbone_requires_grad(model, False):
+            print(f"[Backbone] frozen for first {freeze_epochs} epochs.")
+        else:
+            print("[Backbone][WARN] 未找到可凍結之 backbone 參數（名稱不符？）")
+
+    # Optimizer（只挑 requires_grad=True 的參數）
     params = [p for p in model.parameters() if p.requires_grad]
     O = cfg.get("optimizer", {}) or {}
     opt_name = str(O.get("name", O.get("type", "sgd"))).lower()
@@ -378,7 +407,7 @@ def main():
 
     # Scheduler（iteration 級 cosine 或 epoch 級 StepLR）
     S = cfg.get("scheduler", {}) or {}
-    epochs = int(cfg.get("train", {}).get("epochs", 30))
+    epochs = int(T.get("epochs", 30))
     total_iters = len(loader_train) * epochs
     scheduler_iter = None
     sname = str(S.get("name", S.get("type", "cosine"))).lower()
@@ -390,7 +419,6 @@ def main():
         scheduler_epoch = StepLR(optimizer, step_size=int(S.get("step_size", 8)), gamma=float(S.get("gamma", 0.1)))
 
     # AMP / Accumulate / EMA / EarlyStop
-    T = cfg.get("train", {}) or {}
     amp_enabled = bool(T.get("amp", True))
     scaler      = GradScaler(enabled=amp_enabled and device.type == "cuda")
     accumulate  = int(T.get("accumulate", 1))
@@ -411,16 +439,6 @@ def main():
     stopper     = EarlyStopping(mode=es_mode, patience=es_patience) if es_enabled else None
     print(f"[EarlyStop] {'enabled' if es_enabled else 'disabled'} | monitor={es_monitor} mode={es_mode} patience={es_patience} save_best={es_savebest}")
 
-    # 凍結 backbone 的 epoch 數
-    freeze_epochs = int(T.get("freeze_backbone_epochs", 0))
-    if freeze_epochs > 0:
-        from torch import nn
-        # 嘗試凍結；若找不到名稱也不致失敗
-        if _set_backbone_requires_grad(model, False):
-            print(f"[Backbone] frozen for first {freeze_epochs} epochs.")
-        else:
-            print("[Backbone][WARN] 未找到可凍結之 backbone 參數（名稱不符？）")
-
     # Checkpoint 路徑
     C = cfg.get("checkpoint", {}) or {}
     ckpt_dir  = Path(C.get("dir", "experiments/logs"))
@@ -429,27 +447,36 @@ def main():
     ckpt_last = ckpt_dir / ckpt_name
     ckpt_best = ckpt_dir / ckpt_name.replace(".pth", "_best.pth")
 
+    # Skip-OOD 門檻（可由 YAML train.skip_ood.* 覆蓋）
+    skip_cfg = (T.get("skip_ood", {}) or {})
+
     # 訓練回圈
     best_val = float("inf") if es_mode == "min" else -float("inf")
     print(f"[Train] epochs={epochs}, batch={T.get('batch_size', 2)}, amp={amp_enabled}, accumulate={accumulate}")
     for epoch in range(epochs):
-        # 達到解凍時間點時，解凍 backbone
+        # 達到解凍時間點時，解凍 backbone（並把新解凍參數加入 optimizer）
         if freeze_epochs > 0 and epoch == freeze_epochs:
             if _set_backbone_requires_grad(model, True):
                 print(f"[Backbone] unfrozen at epoch {epoch+1}.")
+                # 重新把 requires_grad=True 的參數補進 optimizer（保留已存在的 param group）
+                new_params = [p for p in model.parameters() if p.requires_grad and (not any(p is q for g in optimizer.param_groups for q in g['params']))]
+                if len(new_params):
+                    optimizer.add_param_group({"params": new_params})
+            else:
+                print("[Backbone][WARN] 解凍失敗（名稱不符？）")
 
         avg_train = train_one_epoch(
             model, loader_train, optimizer, device, epoch, epochs,
             grad_clip=grad_clip, amp_enabled=amp_enabled, scaler=scaler,
             scheduler_iter=scheduler_iter, accumulate=accumulate,
-            print_interval=print_itvl, ema=ema, detector_name=det_name
+            print_interval=print_itvl, ema=ema, detector_name=det_name,
+            skip_cfg=skip_cfg
         )
 
         model_for_val = ema.ema if ema_enabled else model
         avg_val = validate_one_epoch(model_for_val, loader_val, device, amp_enabled=amp_enabled, detector_name=det_name)
 
         if 'scheduler_epoch' in locals() and scheduler_epoch is not None:
-            # 正確順序：optimizer.step() 已在 train_one_epoch 中完成
             scheduler_epoch.step()
 
         print(f"[Epoch {epoch+1}/{epochs}] train_loss={avg_train:.4f} | val_loss={avg_val:.4f} | lr={optimizer.param_groups[0]['lr']:.3e}")

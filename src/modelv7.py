@@ -1,18 +1,23 @@
 # src/modelv7.py
 # ============================================
-# v7 — Minimal & stable Faster R-CNN builder (R101 + FPN P2-P6, GN/FrozenBN, Big RoI Head)
+# v7 — Solid & version-safe Faster R-CNN (ResNet50 + FPN, Dropout head + Label Smoothing)
+# - 完全不使用預訓練權重（符合課程規範）
+# - 加強小物件偵測 (8~96 anchors)
+# - 四層 FC head with Dropout(0.2)
+# - Label Smoothing (0.1)
 # ============================================
 
-from typing import Any, Dict, Iterable, Optional, Tuple, List
+from typing import Any, Dict, List, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision
-from torchvision.ops import MultiScaleRoIAlign, misc as misc_ops
 from torchvision.models.detection import FasterRCNN
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.anchor_utils import AnchorGenerator
-from torchvision.models.detection.backbone_utils import BackboneWithFPN
+from torchvision.ops import MultiScaleRoIAlign, misc as misc_ops
+
 
 # ---------- helpers ----------
 def _maybe_get(d: Dict[str, Any], path: str, default=None):
@@ -23,28 +28,8 @@ def _maybe_get(d: Dict[str, Any], path: str, default=None):
         cur = cur[k]
     return cur
 
-def _make_norm(norm_type: str):
-    nt = (norm_type or "groupnorm32").lower()
-    if nt in ("bn", "batchnorm"):
-        return nn.BatchNorm2d
-    if nt in ("frozenbn", "frozen_batchnorm"):
-        return misc_ops.FrozenBatchNorm2d
-    if nt in ("groupnorm", "groupnorm32", "gn", "gn32"):
-        def _gn(ch):
-            g = 32 if ch % 32 == 0 else (16 if ch % 16 == 0 else 8)
-            return nn.GroupNorm(g, ch)
-        return _gn
-    return nn.BatchNorm2d
-
-def _normalize_sizes_per_level(cfg_model: Dict[str, Any], num_levels: int) -> Tuple[Tuple[int, ...], ...]:
-    """
-    產生 AnchorGenerator 需要的 sizes（每層一個 tuple），並保證長度 == num_levels。
-    允許三種輸入：
-      1) rpn_anchor_sizes_per_level: [[32],[64],[96],[128],[192]]
-      2) rpn_anchor_sizes: [32,64,96,128,192]  # 視為每層主尺度
-      3) rpn_anchor_sizes: [16,24,32]          # 共用同一組尺寸（不推薦，但支援）；會廣播到所有層
-    """
-    # ① 明確逐層
+def _sizes_per_level(cfg_model: Dict[str, Any], num_levels: int) -> Tuple[Tuple[int, ...], ...]:
+    """將 YAML 的 anchors 轉為 AnchorGenerator 可用格式"""
     per_level = cfg_model.get("rpn_anchor_sizes_per_level", None)
     if isinstance(per_level, (list, tuple)) and len(per_level) > 0:
         out: List[Tuple[int, ...]] = []
@@ -53,182 +38,135 @@ def _normalize_sizes_per_level(cfg_model: Dict[str, Any], num_levels: int) -> Tu
                 out.append(tuple(int(v) for v in s))
             elif isinstance(s, (int, float)):
                 out.append((int(s),))
-        # 裁切/補齊為剛好 num_levels
         out = out[:num_levels] + ([out[-1]] * max(0, num_levels - len(out)))
         return tuple(out)
+    # default：小物件密集 anchor
+    default = ((8,), (16,), (32,), (64,), (96,))
+    return default[:num_levels]
 
-    # ② 同長度 list，視為每層主尺度
-    sizes = cfg_model.get("rpn_anchor_sizes", None)
-    if isinstance(sizes, (list, tuple)) and len(sizes) == num_levels and all(isinstance(x, (int, float)) for x in sizes):
-        return tuple((int(x),) for x in sizes)
-
-    # ③ 預設穩健主尺度
-    if sizes is None:
-        base = (32, 64, 96, 128, 192) if num_levels == 5 else (32, 64, 96, 128)
-        return tuple((s,) for s in base)
-
-    # ④ 共用一組尺寸（廣播到所有層）
-    if isinstance(sizes, (int, float)):
-        sizes = [int(sizes)]
-    if isinstance(sizes, (list, tuple)) and all(isinstance(x, (int, float)) for x in sizes):
-        t = tuple((int(x),) for x in sizes)
-        # 廣播/補齊
-        return (t * (num_levels // len(t))) + tuple([t[-1]] * (num_levels % len(t))) if len(t) < num_levels else t[:num_levels]
-
-    # fallback
-    return tuple((32,),) * num_levels
-
-def _normalize_ratios_per_level(cfg_model: Dict[str, Any], num_levels: int) -> Tuple[Tuple[float, ...], ...]:
+def _ratios_per_level(cfg_model: Dict[str, Any], num_levels: int) -> Tuple[Tuple[float, ...], ...]:
     ratios = cfg_model.get("rpn_anchor_ratios", [0.5, 1.0, 2.0])
-    if isinstance(ratios, (list, tuple)) and len(ratios) > 0 and all(isinstance(r, (int, float)) for r in ratios):
-        rtuple = tuple(float(r) for r in ratios)
-    else:
-        rtuple = (0.5, 1.0, 2.0)
+    if not (isinstance(ratios, (list, tuple)) and len(ratios) > 0):
+        ratios = [0.5, 1.0, 2.0]
+    rtuple = tuple(float(r) for r in ratios)
     return (rtuple,) * num_levels
 
-# ---------- Box head：4×FC(1024) ----------
+def _norm_from_yaml(norm_str: str):
+    ns = (norm_str or "frozenbn").lower()
+    if ns in ("frozenbn", "frozen_batchnorm", "frozen"):
+        return misc_ops.FrozenBatchNorm2d
+    if ns in ("bn", "batchnorm"):
+        return nn.BatchNorm2d
+    if ns in ("gn", "groupnorm", "groupnorm32"):
+        def _gn(ch: int):
+            g = 32 if ch % 32 == 0 else (16 if ch % 16 == 0 else 8)
+            return nn.GroupNorm(g, ch)
+        return _gn
+    return misc_ops.FrozenBatchNorm2d
+
+
+# ---------- 自訂 Dropout Head ----------
 class FourFCHead(nn.Module):
-    def __init__(self, in_channels: int, pool_res: int = 14, hidden: int = 1024, num_fc: int = 4):
+    """4層FC + Dropout head"""
+    def __init__(self, in_channels: int, pool_res: int = 7, hidden: int = 1024, dropout_p: float = 0.2):
         super().__init__()
         input_dim = in_channels * pool_res * pool_res
         layers = []
-        for i in range(num_fc):
-            layers += [nn.Linear(input_dim if i == 0 else hidden, hidden), nn.ReLU(inplace=True)]
+        for i in range(4):
+            layers += [
+                nn.Linear(input_dim if i == 0 else hidden, hidden),
+                nn.ReLU(inplace=True),
+                nn.Dropout(p=dropout_p),
+            ]
         self.fc = nn.Sequential(*layers)
+
     def forward(self, x):
-        return self.fc(torch.flatten(x, 1))
+        if x.ndim == 4:
+            x = torch.flatten(x, start_dim=1)
+        return self.fc(x)
 
-# ---------- 核心建構 ----------
-def get_fasterrcnn_r101_fpn(
-    num_classes: int = 2,
-    *,
-    cfg: Optional[Dict[str, Any]] = None,
-    min_size: Optional[int] = None,
-    max_size: Optional[int] = None,
-    image_mean: Iterable[float] = (0.485, 0.456, 0.406),
-    image_std:  Iterable[float] = (0.229, 0.224, 0.225),
-) -> FasterRCNN:
+
+# ---------- 自訂 Label Smoothing Predictor ----------
+class SmoothFastRCNNPredictor(FastRCNNPredictor):
+    """支援 label smoothing 的 classifier"""
+    def __init__(self, in_channels: int, num_classes: int, smoothing: float = 0.1):
+        super().__init__(in_channels, num_classes)
+        self.smoothing = smoothing
+        self.num_classes = num_classes
+
+    def forward(self, x, targets=None):
+        scores = self.cls_score(x)
+        bbox_deltas = self.bbox_pred(x)
+
+        if self.training and targets is not None:
+            labels = targets
+            smooth = self.smoothing
+            with torch.no_grad():
+                soft_labels = torch.full(
+                    (labels.size(0), self.num_classes),
+                    smooth / (self.num_classes - 1),
+                    device=labels.device,
+                )
+                soft_labels.scatter_(1, labels.unsqueeze(1), 1.0 - smooth)
+            log_probs = F.log_softmax(scores, dim=1)
+            loss_cls = -(soft_labels * log_probs).sum(dim=1).mean()
+            return loss_cls, bbox_deltas
+        else:
+            return scores, bbox_deltas
+
+
+# ---------- 核心組裝 ----------
+def get_frcnn_r50_fpn_from_cfg(cfg: Dict[str, Any], *, num_classes: int) -> FasterRCNN:
     C = cfg or {}
-    # 尺度與正規化
-    min_size = int(_maybe_get(C, "model.min_size", min_size) or 1280)
-    max_size = int(_maybe_get(C, "model.max_size", max_size) or 1280)
-    image_mean = list(_maybe_get(C, "model.image_mean", image_mean))
-    image_std  = list(_maybe_get(C, "model.image_std",  image_std))
+    M = C.get("model", {}) or {}
 
-    # FPN / Norm / P6
-    norm_type = str(_maybe_get(C, "model.norm", "groupnorm32"))
-    fpn_out   = int(_maybe_get(C, "model.fpn_out_channels", 256))
-    use_p6    = bool(_maybe_get(C, "model.use_p6", True))
-    norm_layer = _make_norm(norm_type)
+    # I/O 與 Normalization
+    min_size = int(_maybe_get(C, "model.min_size", 1024))
+    max_size = int(_maybe_get(C, "model.max_size", 1024))
+    image_mean = list(_maybe_get(C, "model.image_mean", (0.485, 0.456, 0.406)))
+    image_std  = list(_maybe_get(C, "model.image_std",  (0.229, 0.224, 0.225)))
+    norm_layer = _norm_from_yaml(str(_maybe_get(C, "model.norm", "frozenbn")))
 
-    # ----- backbone + FPN (R101, GN/FrozenBN, +P6) -----
-    resnet = torchvision.models.resnet101(weights=None, norm_layer=norm_layer)
-    return_layers = {"layer1": "0", "layer2": "1", "layer3": "2", "layer4": "3"}
-    in_channels_list = [256, 512, 1024, 2048]
-    extra_blocks = torchvision.ops.feature_pyramid_network.LastLevelMaxPool() if use_p6 else None
-    backbone = BackboneWithFPN(
-        resnet, return_layers, in_channels_list, fpn_out, extra_blocks=extra_blocks
+    # backbone
+    backbone = torchvision.models.detection.backbone_utils.resnet_fpn_backbone(
+        "resnet50", weights=None, trainable_layers=3, norm_layer=norm_layer
     )
 
-    # FPN 層數（與 anchor 完全對齊）
-    num_levels = 5 if use_p6 else 4
-    sizes_per_level  = _normalize_sizes_per_level(_maybe_get(C, "model", {}), num_levels)
-    ratios_per_level = _normalize_ratios_per_level(_maybe_get(C, "model", {}), num_levels)
-    # 最終再防呆一次：確保長度完全一致
-    if len(sizes_per_level) != num_levels:
-        sizes_per_level = sizes_per_level[:num_levels] + tuple([sizes_per_level[-1]] * (num_levels - len(sizes_per_level)))
-    if len(ratios_per_level) != num_levels:
-        ratios_per_level = ratios_per_level[:num_levels] + tuple([ratios_per_level[-1]] * (num_levels - len(ratios_per_level)))
+    fpn_out_ch = getattr(backbone, "out_channels", 256)
+    num_levels = 5  # P2~P6
 
-    # Anchors + RoIAlign
+    # Anchors（小物件友好）
+    sizes_per_level  = _sizes_per_level(M, num_levels)
+    ratios_per_level = _ratios_per_level(M, num_levels)
     anchor_gen = AnchorGenerator(sizes=sizes_per_level, aspect_ratios=ratios_per_level)
-    feat_names: Tuple[str, ...] = ("0", "1", "2", "3", "pool") if use_p6 else ("0", "1", "2", "3")
-    roi_pooler = MultiScaleRoIAlign(featmap_names=feat_names, output_size=int(_maybe_get(C, "model.roi.roi_pool_size", 14)), sampling_ratio=2)
 
-    # RPN（穩健 baseline）
-    RPN = {
-        "batch_per_img": int(_maybe_get(C, "model.rpn.batch_size_per_image", 256)),
-        "pos_frac":      float(_maybe_get(C, "model.rpn.positive_fraction", 0.5)),
-        "fg_iou":        float(_maybe_get(C, "model.rpn.fg_iou_thresh", 0.7)),
-        "bg_iou":        float(_maybe_get(C, "model.rpn.bg_iou_thresh", 0.3)),
-        "pre_train":     int(_maybe_get(C, "model.rpn.pre_nms_top_n_train", 2000)),
-        "post_train":    int(_maybe_get(C, "model.rpn.post_nms_top_n_train", 1000)),
-        "pre_test":      int(_maybe_get(C, "model.rpn.pre_nms_top_n_test",  1000)),
-        "post_test":     int(_maybe_get(C, "model.rpn.post_nms_top_n_test", 1000)),
-        "nms":           float(_maybe_get(C, "model.rpn.nms_thresh", 0.7)),
-    }
-
-    # RoI / Head
-    ROI = {
-        "pool":            int(_maybe_get(C, "model.roi.roi_pool_size", 14)),
-        "hidden":          int(_maybe_get(C, "model.roi.head_hidden_dim", 1024)),
-        "num_fc":          int(_maybe_get(C, "model.roi.head_num_fc", 4)),
-        "bbox_weights":    tuple(_maybe_get(C, "model.roi.bbox_reg_weights", [1.0, 1.0, 1.0, 1.0])),
-        "nms":             float(_maybe_get(C, "model.roi.nms_thresh", 0.5)),
-        "per_img":         int(_maybe_get(C, "model.roi.detections_per_img", 150)),
-        "score_thresh":    float(_maybe_get(C, "model.roi.score_thresh", 0.0)),
-        "box_batch_perimg":int(_maybe_get(C, "model.roi.box_batch_size_per_image", 512)),
-        "box_pos_frac":    float(_maybe_get(C, "model.roi.box_positive_fraction", 0.25)),
-        "fg_iou":          float(_maybe_get(C, "model.roi.fg_iou_thresh", 0.5)),
-        "bg_iou":          float(_maybe_get(C, "model.roi.bg_iou_thresh", 0.5)),
-    }
-
-    # FasterRCNN
+    # Faster R-CNN 本體
     model = FasterRCNN(
         backbone=backbone,
-        num_classes=int(_maybe_get(C, "model.num_classes", 2)),
+        num_classes=num_classes,
         rpn_anchor_generator=anchor_gen,
-        box_roi_pool=roi_pooler,
-        min_size=min_size, max_size=max_size,
-        image_mean=image_mean, image_std=image_std,
-        box_score_thresh=ROI["score_thresh"],
-        box_nms_thresh=ROI["nms"],
-        box_detections_per_img=ROI["per_img"],
+        box_roi_pool=MultiScaleRoIAlign(
+            featmap_names=("0","1","2","3"), output_size=7, sampling_ratio=2),
+        image_mean=image_mean,
+        image_std=image_std,
+        min_size=min_size,
+        max_size=max_size,
     )
 
-    # RPN 參數（相容不同 torchvision 版本）
-    rpn = model.rpn
-    rpn.batch_size_per_image = RPN["batch_per_img"]
-    rpn.positive_fraction    = RPN["pos_frac"]
-    rpn.foreground_iou_threshold = RPN["fg_iou"]
-    rpn.background_iou_threshold = RPN["bg_iou"]
-    rpn.nms_thresh               = RPN["nms"]
-    if hasattr(rpn, "pre_nms_top_n_train"):  rpn.pre_nms_top_n_train  = RPN["pre_train"]
-    if hasattr(rpn, "pre_nms_top_n_test"):   rpn.pre_nms_top_n_test   = RPN["pre_test"]
-    if hasattr(rpn, "post_nms_top_n_train"): rpn.post_nms_top_n_train = RPN["post_train"]
-    if hasattr(rpn, "post_nms_top_n_test"):  rpn.post_nms_top_n_test  = RPN["post_test"]
+    # 替換掉 RoI head 為 Dropout 版
+    in_ch = fpn_out_ch
+    representation_size = 1024
+    model.roi_heads.box_head = FourFCHead(in_ch, pool_res=7, hidden=representation_size, dropout_p=0.2)
+    in_features = representation_size
 
-    # RoI head：4FC×1024 + bbox coder 權重 + 採樣策略
-    out_ch = int(fpn_out)
-    head = FourFCHead(out_ch, ROI["pool"], ROI["hidden"], ROI["num_fc"])
-    model.roi_heads.box_head = head
-    model.roi_heads.box_coder.weights = ROI["bbox_weights"]
-    if hasattr(model.roi_heads, "batch_size_per_image"):
-        model.roi_heads.batch_size_per_image = ROI["box_batch_perimg"]
-    if hasattr(model.roi_heads, "positive_fraction"):
-        model.roi_heads.positive_fraction = ROI["box_pos_frac"]
-    if hasattr(model.roi_heads, "fg_iou_thresh"):
-        model.roi_heads.fg_iou_thresh = ROI["fg_iou"]
-    if hasattr(model.roi_heads, "bg_iou_thresh"):
-        model.roi_heads.bg_iou_thresh = ROI["bg_iou"]
+    # Label smoothing 預測器
+    model.roi_heads.box_predictor = SmoothFastRCNNPredictor(in_features, num_classes, smoothing=0.1)
 
-    # 最終 predictor
-    model.roi_heads.box_predictor = FastRCNNPredictor(ROI["hidden"], int(_maybe_get(C, "model.num_classes", 2)))
     return model
 
-# ---------- 工廠 ----------
-def build_detector_from_cfg(cfg: Dict[str, Any]):
-    m = cfg.get("model", {}) if isinstance(cfg, dict) else {}
-    name = str(m.get("detector", "fasterrcnn_r101_fpn_v7")).lower()
-    num_classes = int(m.get("num_classes", 2))
-    min_size = _maybe_get(cfg, "model.min_size", None)
-    max_size = _maybe_get(cfg, "model.max_size", None)
-    image_mean = tuple(_maybe_get(cfg, "model.image_mean", (0.485, 0.456, 0.406)))
-    image_std  = tuple(_maybe_get(cfg, "model.image_std",  (0.229, 0.224, 0.225)))
 
-    return get_fasterrcnn_r101_fpn(
-        num_classes=num_classes,
-        min_size=min_size, max_size=max_size,
-        image_mean=image_mean, image_std=image_std,
-        cfg=cfg
-    )
+# ---------- 工廠 ----------
+def build_detector_from_cfg(cfg: Dict[str, Any]) -> FasterRCNN:
+    m = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+    num_classes = int(m.get("num_classes", 2))
+    return get_frcnn_r50_fpn_from_cfg(cfg, num_classes=num_classes)
