@@ -75,7 +75,7 @@ model:
     roi_pool_size: 11
     head_hidden_dim: 1024
     head_num_fc: 4
-    bbox_reg_weights: [10.0, 10.0, 5.0, 5.0]
+    bbox_reg_weights: [1.0, 1.0, 1.0, 1.0]
     nms_thresh: 0.5
     detections_per_img: 150
     score_thresh: 0.0
@@ -102,8 +102,8 @@ augment:
 train:
   epochs: 54                # 延長訓練，允許 cosine 慢收斂
   batch_size: 2             # 小 batch 保守顯存
-  accumulate: 8             # 等效大 batch（穩定梯度）
-  amp: true
+  accumulate: 4             # 等效大 batch（穩定梯度）
+  amp: false
   cudnn_benchmark: true
   grad_clip: 1.0
 
@@ -129,7 +129,7 @@ train:
 # ---------------------------------------------------------
 optimizer:
   type: adamw              # ← AdamW 通常在小 batch 下更穩
-  lr: 0.001                # ← LR 降 3 倍避免過擬合
+  lr: 0.0003                # ← LR 降 3 倍避免過擬合
   weight_decay: 0.0008
   betas: [0.9, 0.999]
 

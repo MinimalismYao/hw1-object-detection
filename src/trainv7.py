@@ -6,21 +6,20 @@ trainv7.py — YAML-driven detector training (clean & safe)
 
 設計原則：
 - 不用 CLI；所有參數來自 YAML，必要覆寫集中在檔頭 OVERRIDES。
-- 與推論同概念：簡潔、可重現、安全。
-- 功能：單類別標籤位移（Retina=0-based / FRCNN=1-based）、AMP、Cosine+Warmup 或 StepLR、
-        EMA（可選）、Early Stop（可選），儲存 best/last state_dict（weights-only）。
-- 可選「訓練後自動評估」：簡化成直接呼叫 eval.main() 並只覆寫 checkpoint 路徑。
+- 功能：AMP（PyTorch 2.x 新寫法）、Cosine+Warmup 或 StepLR、EMA、Early Stop、
+        凍結/解凍 backbone、NaN/Inf 防呆、驗證列印 loss 組成（可定位爆點）。
+- 與 torchvision detection 相容：val 階段維持 model.train() 以回傳 loss。
 """
 
 from pathlib import Path
-import os, sys, math, random, traceback
+import sys, math, random, traceback
 from typing import Dict, Any, List
 
 import torch
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import StepLR, LambdaLR
+from torch.amp import autocast, GradScaler
 from tqdm import tqdm
-from PIL import Image  # 只是確保 pillow 安裝，未直接使用
 
 from config import load_cfg
 from modelv7 import build_detector_from_cfg
@@ -30,9 +29,12 @@ from transforms import get_transforms
 # ========= 可在這裡覆寫 YAML 參數（不需 CLI）=========
 CFG_PATH   = "experiments/configs/v7.yaml"
 OVERRIDES  = [
-    # 例： "train.epochs=36", "optimizer.lr=0.0025"
+    # 例："train.epochs=36", "optimizer.lr=0.0025"
 ]
 # ===============================================
+
+# === 開關：為了安全，先關閉任何自動 label 轉換 ===
+ENABLE_LABEL_REMAP = False
 
 
 # ---------------- 小工具 ----------------
@@ -103,10 +105,9 @@ def _targets_to_device(targets: List[dict], device):
 
 
 def _remap_labels_for_detector(detector_name: str, targets: List[dict]):
-    """
-    RetinaNet / SSD：前景 0-based（num_classes 不含背景）→ labels=0
-    Faster R-CNN  ：前景 1-based（num_classes 含背景）→ labels=1
-    """
+    """預設不改 label；必要時再開 ENABLE_LABEL_REMAP。"""
+    if not ENABLE_LABEL_REMAP:
+        return targets
     dn = (detector_name or "").lower()
     use_zero = ("retina" in dn) or ("ssd" in dn)
     out = []
@@ -127,15 +128,17 @@ def build_iter_scheduler(optimizer, scfg: Dict[str, Any], total_iters: int):
     wcfg = scfg.get("warmup", {}) or {}
     warmup_steps = int(wcfg.get("steps", 0))
     start_factor = float(wcfg.get("start_factor", 0.1))
+    min_lr_ratio = float(scfg.get("min_lr_ratio", 0.0))
 
     def lr_lambda(cur_iter):
         # 線性 warmup
         if warmup_steps > 0 and cur_iter < warmup_steps:
             return start_factor + (1.0 - start_factor) * (cur_iter / float(max(1, warmup_steps)))
-        # cosine 到 0
+        # cosine 到 min_lr_ratio
         progress = (cur_iter - warmup_steps) / float(max(1, total_iters - warmup_steps))
         progress = min(max(progress, 0.0), 1.0)
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
+        cos = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cos
 
     return LambdaLR(optimizer, lr_lambda=lr_lambda)
 
@@ -158,20 +161,13 @@ def quick_sanity_check(model, device, cfg: Dict[str, Any], detector_name: str):
 
 # ---------------- Train / Val ----------------
 def train_one_epoch(model, loader, optimizer, device, epoch_idx, total_epochs,
-                    grad_clip=None, amp=False, scaler=None, scheduler_iter=None, accumulate=1,
+                    grad_clip=None, amp_enabled=False, scaler: GradScaler=None, scheduler_iter=None, accumulate=1,
                     print_interval=10, ema: ModelEMA = None, detector_name: str = ""):
     model.train()
     loss_smooth = SmoothedValue()
     pbar = tqdm(loader, total=len(loader), ncols=120, desc=f"Epoch {epoch_idx+1}/{total_epochs}")
 
     optimizer.zero_grad(set_to_none=True)
-    autocast_ctx = torch.amp.autocast(device_type="cuda") if (amp and device.type == "cuda") else torch.no_grad if False else None
-    # 用簡潔語法包裝 autocast
-    class _Ctx:
-        def __enter__(self): return torch.amp.autocast(device_type="cuda").__enter__() if (amp and device.type=="cuda") else None
-        def __exit__(self, exc_type, exc, tb): 
-            if (amp and device.type=="cuda"): torch.amp.autocast(device_type="cuda").__exit__(exc_type, exc, tb)
-    ctx = _Ctx()
 
     total_loss, steps = 0.0, 0
     for step, (images, targets) in enumerate(pbar, 1):
@@ -179,37 +175,46 @@ def train_one_epoch(model, loader, optimizer, device, epoch_idx, total_epochs,
         targets = _targets_to_device([{k: v for k, v in t.items()} for t in targets], device)
         targets = _remap_labels_for_detector(detector_name, targets)
 
-        with (torch.amp.autocast(device_type="cuda") if (amp and device.type=="cuda") else torch.autocast("cpu", enabled=False)):
+        with autocast("cuda", enabled=amp_enabled and device.type == "cuda"):
             loss_dict = model(images, targets)
             loss = sum(loss_dict.values())
 
+        # NaN/Inf guard
+        loss_val = float(loss.detach().item())
+        if (math.isnan(loss_val)) or (math.isinf(loss_val)):
+            comp = {k: float(v.detach().item()) for k, v in loss_dict.items()}
+            print(f"\n[NaN/Inf DETECTED] epoch={epoch_idx+1} step={step} "
+                  f"loss={loss_val} parts={comp} lr={optimizer.param_groups[0]['lr']:.3e}")
+            raise RuntimeError("Loss became NaN/Inf. Check LR/AMP/labels/boxes.")
+
         loss_scaled = loss / max(1, accumulate)
-        if amp and scaler is not None:
+        if amp_enabled and scaler is not None and device.type == "cuda":
             scaler.scale(loss_scaled).backward()
         else:
             loss_scaled.backward()
 
         if step % max(1, accumulate) == 0:
             if grad_clip:
-                if amp and scaler is not None:
+                if amp_enabled and scaler is not None and device.type == "cuda":
                     scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
-            if amp and scaler is not None:
+            if amp_enabled and scaler is not None and device.type == "cuda":
                 scaler.step(optimizer); scaler.update()
             else:
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             if scheduler_iter is not None:
+                # 正確順序：optimizer.step() 之後再 scheduler.step()
                 scheduler_iter.step()
             if ema is not None:
                 ema.update(model)
 
-        loss_val = float(loss.item())
         total_loss += loss_val
         steps += 1
         loss_smooth.update(loss_val)
         if step % max(1, print_interval) == 0:
-            pbar.set_postfix({"loss": f"{loss_smooth.value():.3f}", "lr": f"{optimizer.param_groups[0]['lr']:.2e}"})
+            pbar.set_postfix({"loss": f"{loss_smooth.value():.3f}",
+                              "lr": f"{optimizer.param_groups[0]['lr']:.2e}"})
 
         # 釋放張量引用
         del loss_dict, loss, images, targets
@@ -218,19 +223,42 @@ def train_one_epoch(model, loader, optimizer, device, epoch_idx, total_epochs,
 
 
 @torch.no_grad()
-def validate_one_epoch(model, loader, device, amp=False, detector_name: str = ""):
-    # torchvision detection 需保持 train() 以回傳 loss
+def validate_one_epoch(model, loader, device, amp_enabled=False, detector_name: str = ""):
+    """注意：torchvision detection 要保持 model.train() 才會回傳 loss。"""
     model.train()
-    total, n = 0.0, 0
+    total = 0.0
+    n = 0
     for images, targets in loader:
         images  = [img.to(device, non_blocking=True) for img in images]
         targets = _targets_to_device([{k: v for k, v in t.items()} for t in targets], device)
         targets = _remap_labels_for_detector(detector_name, targets)
-        with (torch.amp.autocast(device_type="cuda") if (amp and device.type=="cuda") else torch.autocast("cpu", enabled=False)):
-            loss = sum(model(images, targets).values())
+
+        with autocast("cuda", enabled=amp_enabled and device.type == "cuda"):
+            loss_dict = model(images, targets)
+            loss = sum(loss_dict.values())
+
         total += float(loss.item())
         n += 1
+
+        # 每 50 個 batch 印一次詳細 loss 組成
+        if (n % 50) == 0:
+            comp = {k: float(v.detach().item()) for k, v in loss_dict.items()}
+            print(f"[VAL DBG] step={n} loss={float(loss.item()):.4f} parts={comp}")
+
+        del loss_dict, loss, images, targets
+
     return total / max(1, n)
+
+
+def _set_backbone_requires_grad(model: torch.nn.Module, enable: bool):
+    """嘗試凍結/解凍 backbone；依常見命名覆蓋到 FPN 前的主幹。"""
+    names = ["backbone.body", "backbone", "transformer.backbone"]
+    found = False
+    for n, p in model.named_parameters():
+        if any(n.startswith(k) for k in names):
+            p.requires_grad_(enable)
+            found = True
+    return found
 
 
 # ---------------- Main ----------------
@@ -258,7 +286,7 @@ def main():
     if bool(cfg.get("sanity_check", {}).get("enabled", True)):
         quick_sanity_check(model, device, cfg, det_name)
 
-    # 轉換（與 YAML 對齊；若缺值使用保守預設）
+    # 轉換（與 YAML 對齊）
     A = cfg.get("augment", {}) or {}
     max_side = int(A.get("max_side", cfg.get("model", {}).get("max_size", 1280)))
     train_tfms = get_transforms(
@@ -266,7 +294,7 @@ def main():
         max_side=max_side,
         flip_p=float(A.get("flip_p", 0.5)),
         hsv=A.get("hsv", [0.015, 0.70, 0.40]),
-        resize=A.get("resize", [896, 1024, 1200, 1400]),
+        resize=A.get("resize", [896, 1024]),
         mosaic=bool(A.get("mosaic", False)),
         min_box_size=float(cfg.get("data", {}).get("min_box_wh", [1, 1])[0]),
         color_jitter_prob=float(A.get("color_jitter_prob", 0.0)),
@@ -310,11 +338,19 @@ def main():
     O = cfg.get("optimizer", {}) or {}
     opt_name = str(O.get("name", O.get("type", "sgd"))).lower()
     if opt_name == "adamw":
-        optimizer = torch.optim.AdamW(params, lr=float(O.get("lr", 0.0005)), weight_decay=float(O.get("weight_decay", 0.0005)))
+        optimizer = torch.optim.AdamW(
+            params,
+            lr=float(O.get("lr", 0.0005)),
+            weight_decay=float(O.get("weight_decay", 0.0005)),
+            betas=tuple(O.get("betas", [0.9, 0.999])),
+        )
     else:
-        optimizer = torch.optim.SGD(params, lr=float(O.get("lr", 0.005)),
-                                    momentum=float(O.get("momentum", 0.9)),
-                                    weight_decay=float(O.get("weight_decay", 0.0005)))
+        optimizer = torch.optim.SGD(
+            params,
+            lr=float(O.get("lr", 0.005)),
+            momentum=float(O.get("momentum", 0.9)),
+            weight_decay=float(O.get("weight_decay", 0.0005)),
+        )
 
     # Scheduler（iteration 級 cosine 或 epoch 級 StepLR）
     S = cfg.get("scheduler", {}) or {}
@@ -331,8 +367,8 @@ def main():
 
     # AMP / Accumulate / EMA / EarlyStop
     T = cfg.get("train", {}) or {}
-    use_amp     = bool(T.get("amp", True))
-    scaler      = torch.amp.GradScaler(enabled=use_amp)
+    amp_enabled = bool(T.get("amp", True))
+    scaler      = GradScaler(enabled=amp_enabled and device.type == "cuda")
     accumulate  = int(T.get("accumulate", 1))
     grad_clip   = float(T.get("grad_clip", T.get("grad_clip_norm", 0.0))) or None
     print_itvl  = int(cfg.get("logging", {}).get("print_interval", 10))
@@ -351,6 +387,16 @@ def main():
     stopper     = EarlyStopping(mode=es_mode, patience=es_patience) if es_enabled else None
     print(f"[EarlyStop] {'enabled' if es_enabled else 'disabled'} | monitor={es_monitor} mode={es_mode} patience={es_patience} save_best={es_savebest}")
 
+    # 凍結 backbone 的 epoch 數
+    freeze_epochs = int(T.get("freeze_backbone_epochs", 0))
+    if freeze_epochs > 0:
+        from torch import nn
+        # 嘗試凍結；若找不到名稱也不致失敗
+        if _set_backbone_requires_grad(model, False):
+            print(f"[Backbone] frozen for first {freeze_epochs} epochs.")
+        else:
+            print("[Backbone][WARN] 未找到可凍結之 backbone 參數（名稱不符？）")
+
     # Checkpoint 路徑
     C = cfg.get("checkpoint", {}) or {}
     ckpt_dir  = Path(C.get("dir", "experiments/logs"))
@@ -361,21 +407,28 @@ def main():
 
     # 訓練回圈
     best_val = float("inf") if es_mode == "min" else -float("inf")
-    print(f"[Train] epochs={epochs}, batch={T.get('batch_size', 2)}, amp={use_amp}, accumulate={accumulate}")
+    print(f"[Train] epochs={epochs}, batch={T.get('batch_size', 2)}, amp={amp_enabled}, accumulate={accumulate}")
     for epoch in range(epochs):
+        # 達到解凍時間點時，解凍 backbone
+        if freeze_epochs > 0 and epoch == freeze_epochs:
+            if _set_backbone_requires_grad(model, True):
+                print(f"[Backbone] unfrozen at epoch {epoch+1}.")
+
         avg_train = train_one_epoch(
             model, loader_train, optimizer, device, epoch, epochs,
-            grad_clip=grad_clip, amp=use_amp, scaler=scaler,
+            grad_clip=grad_clip, amp_enabled=amp_enabled, scaler=scaler,
             scheduler_iter=scheduler_iter, accumulate=accumulate,
             print_interval=print_itvl, ema=ema, detector_name=det_name
         )
+
         model_for_val = ema.ema if ema_enabled else model
-        avg_val = validate_one_epoch(model_for_val, loader_val, device, amp=use_amp, detector_name=det_name)
+        avg_val = validate_one_epoch(model_for_val, loader_val, device, amp_enabled=amp_enabled, detector_name=det_name)
 
         if 'scheduler_epoch' in locals() and scheduler_epoch is not None:
+            # 正確順序：optimizer.step() 已在 train_one_epoch 中完成
             scheduler_epoch.step()
 
-        print(f"[Epoch {epoch+1}/{epochs}] train_loss={avg_train:.4f} | val_loss={avg_val:.4f}")
+        print(f"[Epoch {epoch+1}/{epochs}] train_loss={avg_train:.4f} | val_loss={avg_val:.4f} | lr={optimizer.param_groups[0]['lr']:.3e}")
 
         # EarlyStop
         monitor_val = avg_val if es_monitor == "val_loss" else avg_train
@@ -390,7 +443,8 @@ def main():
         else:
             # 無 early stop 時也更新 best（方便拿 best.pth）
             if es_savebest:
-                if (es_mode == "min" and monitor_val <= best_val) or (es_mode == "max" and monitor_val >= best_val):
+                cond = (es_mode == "min" and monitor_val <= best_val) or (es_mode == "max" and monitor_val >= best_val)
+                if cond:
                     best_val = monitor_val
                     torch.save((ema.ema if ema_enabled else model).state_dict(), ckpt_best)
                     print(f"[Save][best] {ckpt_best}")
