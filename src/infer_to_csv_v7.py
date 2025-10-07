@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-src/infer_to_csv_v7.py  ·  Kaggle 提交（FRCNN/RetinaNet/SSDLite 通用）
-- 與訓練同一份 YAML（含 detector/anchors/尺寸/NMS/Tiling）
-- Image_ID: 使用 enumerate 從 1 開始的整數
-- PredictionString: 固定 "conf x y w h class"（class 永遠 0）
+src/infer_to_csv_v7.py  ·  Kaggle 提交（精簡、安全、可重現）
+- 與訓練配置對齊：讀 YAML + build_detector_from_cfg
+- 嚴格輸出格式：PredictionString = "conf x y w h 0"
+- 安全防呆：裁邊、過濾非法框、NMS、Top-K、四捨五入壓縮體積
+- 影像排序：以檔名中的數字為主（容忍前導零）；無數字則回退字串序
 """
 
 from pathlib import Path
-import csv
+import os, re, glob, csv, math
 from typing import List, Tuple
 
 import torch
@@ -19,337 +20,201 @@ from PIL import Image
 from tqdm import tqdm
 
 from config import load_cfg
-from modelv7 import build_detector_from_cfg  # v7：可切換架構的工廠
+from modelv7 import build_detector_from_cfg
 
-# ========= 覆寫設定（可留空） =========
+# ========== 可調參數（集中於此，不需 CLI） ==========
+# 設定檔與權重（建議覆寫為你實際路徑）
 CFG_PATH = "experiments/configs/v7.yaml"
 OVERRIDES = [
-    # 範例：指定 checkpoint 與輸出 run_name
-    # "checkpoint.save_full_path=experiments/logs/fasterrcnn_v7/fasterrcnn_v7_best.pth",
-    # "project.run_name=submit_v7",
+    # 權重位置（若 YAML 已設可留空或同名覆寫）
+    "checkpoint.save_full_path=experiments/logs/fasterrcnn_v7/fasterrcnn_v7_best.pth",
+    # 推論後處理（保守且通用）
+    "infer.score_thr=0.25",
+    "infer.nms_iou=0.50",
+    "infer.postproc.topk_per_image=100",
 ]
-# ====================================
+# 單類別競賽固定輸出 0；若為多類別，請改成讀 labels 值
+FIXED_CLASS_ID = 0
+# 小數位數（壓縮 CSV 體積）
+ROUND_CONF = 4
+ROUND_COORD = 1
+# ===============================================
 
+_VALID_EXTS = ("*.jpg","*.jpeg","*.png","*.bmp","*.JPG","*.JPEG","*.PNG","*.BMP")
+_NUM_RE = re.compile(r"(\d+)")
 
-def list_images_sorted(img_dir: str) -> list[Path]:
+# ---------- 工具函式 ----------
+def _numeric_id_from_path(path: str, fallback):
+    """從檔名擷取數字（容忍前導零）；若無數字，回傳 fallback。"""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    m = _NUM_RE.search(stem)
+    if not m:
+        return fallback
+    s = m.group(1).lstrip("0")
+    return int(s) if s != "" else 0
+
+def _list_images_sorted(img_dir: str) -> List[Path]:
     p = Path(img_dir)
-    files = [*p.glob("*.jpg"), *p.glob("*.jpeg"), *p.glob("*.png"), *p.glob("*.bmp"),
-             *p.glob("*.JPG"), *p.glob("*.JPEG"), *p.glob("*.PNG"), *p.glob("*.BMP")]
-    def _key(fp: Path):
-        stem = fp.stem.lstrip("0")
-        return (0, int(stem)) if stem.isdigit() else (1, fp.stem)
-    return sorted(files, key=_key)
+    files: List[Path] = []
+    for pat in _VALID_EXTS:
+        files.extend(p.glob(pat))
+    # 先以數字排序，再以字串排序，確保穩定
+    return sorted(files, key=lambda f: (_numeric_id_from_path(str(f), 10**12), f.stem))
 
-
-def resize_keep_max_side(img: Image.Image, max_side: int) -> Tuple[Image.Image, float]:
-    """把影像縮到最長邊=max_side，回傳 (image, scale)。"""
-    w, h = img.size
-    m = max(w, h)
-    if m <= max_side:
-        return img, 1.0
-    s = float(max_side) / m
-    new_w, new_h = int(round(w * s)), int(round(h * s))
-    return img.resize((new_w, new_h), Image.BILINEAR), s
-
-
-def xyxy_to_xywh(boxes: torch.Tensor) -> torch.Tensor:
+def _xyxy_to_xywh(boxes: torch.Tensor) -> torch.Tensor:
+    """(x1,y1,x2,y2) -> (x,y,w,h)"""
     xywh = boxes.clone()
     xywh[:, 2] = xywh[:, 2] - xywh[:, 0]
     xywh[:, 3] = xywh[:, 3] - xywh[:, 1]
     return xywh
 
+def _clip_xyxy(x1, y1, x2, y2, W, H) -> Tuple[float,float,float,float]:
+    x1 = max(0.0, min(float(x1), W))
+    y1 = max(0.0, min(float(y1), H))
+    x2 = max(0.0, min(float(x2), W))
+    y2 = max(0.0, min(float(y2), H))
+    return x1, y1, x2, y2
 
-def _state_to_fp32(state):
-    for k, v in list(state.items()):
-        if isinstance(v, torch.Tensor) and v.is_floating_point() and v.dtype == torch.float16:
-            state[k] = v.float()
-    return state
+# ---------- 安全載入權重 ----------
+def _safe_load_state(ckpt_path: Path) -> dict:
+    """
+    優先用 weights_only=True 載入，舊版 PyTorch 沒有此參數時自動回退。
+    最終回傳 state_dict(dict)。若是 checkpoint 包裝，會自動取出 'state_dict' 或 'model'。
+    """
+    try:
+        obj = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
+    except TypeError:
+        obj = torch.load(str(ckpt_path), map_location="cpu")
 
+    # 兼容常見儲存格式
+    if isinstance(obj, dict):
+        if "state_dict" in obj and isinstance(obj["state_dict"], dict):
+            obj = obj["state_dict"]
+        elif "model" in obj and isinstance(obj["model"], dict):
+            obj = obj["model"]
 
-def _detector_fg_label(detector_name: str) -> int:
-    """回傳模型輸出中的前景 label（FRCNN=1；Retina/SSD=0）。"""
-    dn = (detector_name or "").lower()
-    if "retina" in dn or "ssd" in dn:
-        return 0
-    return 1  # Faster R-CNN 系列
+    if not isinstance(obj, dict):
+        raise RuntimeError("Checkpoint does not contain a valid state_dict dictionary.")
+    return obj
 
-
-# ---------------- Soft/Hard NMS 封裝 ----------------
-def soft_nms_gaussian(boxes, scores, iou_thresh, sigma, score_thresh) -> List[int]:
-    boxes = boxes.clone().cpu()
-    scores = scores.clone().cpu()
-    keep_scores = scores.clone()
-    order = scores.argsort(descending=True).tolist()
-    kept = []
-    while order:
-        i = order.pop(0)
-        kept.append(i)
-        if not order:
-            break
-        ious = torchvision.ops.box_iou(boxes[i].unsqueeze(0), boxes[order]).squeeze(0)
-        decay = torch.exp(-(ious ** 2) / max(1e-9, sigma))
-        keep_scores[order] = keep_scores[order] * decay
-        order = [j for j in order if keep_scores[j] >= score_thresh]
-        order.sort(key=lambda j: float(keep_scores[j]), reverse=True)
-    kept.sort(key=lambda j: float(keep_scores[j]), reverse=True)
-    return kept
-
-
-def soft_nms_linear_or_hard(boxes, scores, iou_thresh, method, score_thresh) -> List[int]:
-    if method == "hard":
-        return nms(boxes, scores, iou_thresh).cpu().tolist()
-    boxes = boxes.clone().cpu()
-    scores = scores.clone().cpu()
-    keep_scores = scores.clone()
-    order = scores.argsort(descending=True).tolist()
-    kept = []
-    while order:
-        i = order.pop(0)
-        kept.append(i)
-        if not order:
-            break
-        ious = torchvision.ops.box_iou(boxes[i].unsqueeze(0), boxes[order]).squeeze(0)
-        decay = torch.ones_like(ious)
-        mask = ious > iou_thresh
-        decay[mask] = 1 - ious[mask]
-        keep_scores[order] = keep_scores[order] * decay
-        order = [j for j in order if keep_scores[j] >= score_thresh]
-        order.sort(key=lambda j: float(keep_scores[j]), reverse=True)
-    kept.sort(key=lambda j: float(keep_scores[j]), reverse=True)
-    return kept
-
-
-def run_nms_like_cfg(boxes: torch.Tensor, scores: torch.Tensor, cfg: dict) -> Tuple[torch.Tensor, torch.Tensor]:
-    """依 YAML 的 infer/postproc 執行 Soft-NMS 或 Hard-NMS。"""
-    score_thr = float(cfg["infer"]["score_thr"])
-    nms_iou   = float(cfg["infer"]["nms_iou"])
-    max_det   = int(cfg.get("infer", {}).get("postproc", {}).get("topk_per_image",
-                      int(cfg.get("eval", {}).get("max_det", 100))))
-    pp = cfg.get("infer", {}).get("postproc", {})
-    soft_cfg = pp.get("soft_nms", {})
-    use_soft = bool(soft_cfg.get("enabled", False))
-    soft_method = str(soft_cfg.get("method", "gaussian"))
-    soft_sigma  = float(soft_cfg.get("sigma", 0.5))
-    soft_iou    = float(soft_cfg.get("iou_thresh", nms_iou))
-    soft_score_floor = float(soft_cfg.get("score_thresh", 0.0))
-
-    # 初步門檻
-    if boxes.numel() > 0:
-        k0 = scores >= score_thr
-        boxes, scores = boxes[k0], scores[k0]
-
-    # NMS
-    if boxes.numel() > 0:
-        if use_soft:
-            if soft_method == "gaussian":
-                keep_idx = soft_nms_gaussian(boxes, scores, iou_thresh=soft_iou, sigma=soft_sigma, score_thresh=soft_score_floor)
-            else:
-                keep_idx = soft_nms_linear_or_hard(boxes, scores, iou_thresh=soft_iou, method=soft_method, score_thresh=soft_score_floor)
-        else:
-            keep_idx = nms(boxes, scores, nms_iou).cpu().tolist()
-        boxes, scores = boxes[keep_idx], scores[keep_idx]
-
-    # Top-K
-    if boxes.numel() > 0 and boxes.shape[0] > max_det:
-        vals, idxs = torch.topk(scores, k=max_det)
-        boxes, scores = boxes[idxs], vals
-
-    return boxes, scores
-
-
-def area_aware_threshold(boxes: torch.Tensor, scores: torch.Tensor, cfg: dict) -> Tuple[torch.Tensor, torch.Tensor]:
-    """按面積再做一層分數門檻（原圖座標）。"""
-    pp = cfg.get("infer", {}).get("postproc", {})
-    area_cfg = pp.get("area_aware_score", {})
-    if not bool(area_cfg.get("enabled", False)) or boxes.numel() == 0:
-        return boxes, scores
-
-    small_thr  = float(area_cfg.get("small_thr", 0.05))
-    medium_thr = float(area_cfg.get("medium_thr", 0.05))
-    large_thr  = float(area_cfg.get("large_thr", 0.05))
-    small_area = float(area_cfg.get("small_area", 32**2))
-    large_area = float(area_cfg.get("large_area", 96**2))
-
-    areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
-    thr_vec = torch.full_like(areas, medium_thr, dtype=torch.float32)
-    thr_vec[areas <  small_area] = small_thr
-    thr_vec[areas >= large_area] = large_thr
-    k = scores >= thr_vec
-    return boxes[k], scores[k]
-
-
-# ---------------- 單張推論（不切塊） ----------------
-def infer_single_image_no_tiling(model, pil: Image.Image, device, cfg: dict, fg_label: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    W0, H0 = pil.size
-    max_side = int(cfg["augment"]["max_side"])
-    resized, scale = resize_keep_max_side(pil, max_side)
-    tensor = TF.to_tensor(resized).to(device)
-
-    out = model([tensor])[0]
-    boxes, scores, labels = out["boxes"], out["scores"], out["labels"]
-    keep = (labels == fg_label)
-    boxes, scores = boxes[keep], scores[keep]
-
-    # 還原座標 & 邊界裁切
-    if boxes.numel() > 0:
-        if scale != 1.0:
-            boxes = boxes / float(scale)
-        x1 = boxes[:, 0].clamp_(0, W0 - 1)
-        y1 = boxes[:, 1].clamp_(0, H0 - 1)
-        x2 = boxes[:, 2].clamp_(0, W0 - 1)
-        y2 = boxes[:, 3].clamp_(0, H0 - 1)
-        boxes = torch.stack([x1, y1, x2, y2], dim=1)
-        # 剔除非正寬高
-        wh = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
-        kpos = wh > 0
-        boxes, scores = boxes[kpos], scores[kpos]
-
-    # NMS + 面積門檻 + TopK
-    boxes, scores = run_nms_like_cfg(boxes, scores, cfg)
-    boxes, scores = area_aware_threshold(boxes, scores, cfg)
-    return boxes, scores
-
-
-# ---------------- 切塊推論 ----------------
-def make_grid_tiles(W: int, H: int, tile: int, overlap: float) -> List[Tuple[int, int, int, int]]:
-    """回傳一組 tile 區塊 (x0,y0,x1,y1) 覆蓋整張圖。"""
-    stride = max(1, int(round(tile * (1.0 - overlap))))
-    xs = list(range(0, max(1, W - tile + 1), stride))
-    ys = list(range(0, max(1, H - tile + 1), stride))
-    if len(xs) == 0: xs = [0]
-    if len(ys) == 0: ys = [0]
-    if xs[-1] + tile < W: xs.append(W - tile)
-    if ys[-1] + tile < H: ys.append(H - tile)
-
-    boxes = []
-    for y in ys:
-        for x in xs:
-            x0, y0 = max(0, x), max(0, y)
-            x1, y1 = min(W, x0 + tile), min(H, y0 + tile)
-            boxes.append((x0, y0, x1, y1))
-    return boxes
-
-
-def infer_single_image_tiling(model, pil: Image.Image, device, cfg: dict, fg_label: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    W0, H0 = pil.size
-    tcfg = cfg.get("infer", {}).get("tiling", {})
-    tile_size = int(tcfg.get("tile_size", 1024))
-    overlap   = float(tcfg.get("overlap", 0.15))
-    max_side  = int(cfg["augment"]["max_side"])  # 每塊推論時也縮到這個
-
-    all_boxes, all_scores = [], []
-
-    for (x0, y0, x1, y1) in make_grid_tiles(W0, H0, tile_size, overlap):
-        crop = pil.crop((x0, y0, x1, y1))
-        resized, scale = resize_keep_max_side(crop, max_side)
-        tensor = TF.to_tensor(resized).to(device)
-
-        out = model([tensor])[0]
-        boxes, scores, labels = out["boxes"], out["scores"], out["labels"]
-        keep = (labels == fg_label)
-        boxes, scores = boxes[keep], scores[keep]
-
-        if boxes.numel() > 0:
-            if scale != 1.0:
-                boxes = boxes / float(scale)
-            boxes[:, [0, 2]] += float(x0)
-            boxes[:, [1, 3]] += float(y0)
-            # 邊界裁切與正面積檢查
-            x1c = boxes[:, 0].clamp_(0, W0 - 1)
-            y1c = boxes[:, 1].clamp_(0, H0 - 1)
-            x2c = boxes[:, 2].clamp_(0, W0 - 1)
-            y2c = boxes[:, 3].clamp_(0, H0 - 1)
-            boxes = torch.stack([x1c, y1c, x2c, y2c], dim=1)
-            wh = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
-            kpos = wh > 0
-            if kpos.any():
-                all_boxes.append(boxes[kpos])
-                all_scores.append(scores[kpos])
-
-    if len(all_boxes) == 0:
-        return torch.zeros((0, 4), dtype=torch.float32), torch.zeros((0,), dtype=torch.float32)
-
-    boxes = torch.cat(all_boxes, dim=0)
-    scores = torch.cat(all_scores, dim=0)
-
-    # 全域 NMS + 面積門檻 + TopK（依 YAML）
-    boxes, scores = run_nms_like_cfg(boxes, scores, cfg)
-    boxes, scores = area_aware_threshold(boxes, scores, cfg)
-    return boxes, scores
-
-
-# ---------------- 主流程 ----------------
+# ---------- 主流程 ----------
 @torch.inference_mode()
 def main():
+    torch.backends.cudnn.benchmark = True
+
+    # 專案根路徑（src/ 的上一層）
     project_root = Path(__file__).resolve().parents[1]
+
+    # 讀設定（允許覆寫）
     cfg = load_cfg(str(project_root / CFG_PATH), overrides=OVERRIDES)
 
-    ckpt_cfg = cfg["checkpoint"]
-    ckpt_path = Path(ckpt_cfg.get("save_full_path") or (Path(ckpt_cfg["dir"]) / ckpt_cfg["name"]))
-    test_dir = Path(cfg["data"]["test_img_dir"])
-    out_csv = Path(cfg["infer"]["submission_csv"])
+    # 路徑與裝置
+    ckpt_cfg = cfg.get("checkpoint", {})
+    ckpt_path = ckpt_cfg.get("save_full_path") or (
+        Path(ckpt_cfg.get("dir", "")) / ckpt_cfg.get("name", "")
+    )
+    ckpt_path = project_root / ckpt_path if not os.path.isabs(str(ckpt_path)) else Path(ckpt_path)
+
+    test_dir = cfg["data"]["test_img_dir"]
+    test_dir = project_root / test_dir if not os.path.isabs(test_dir) else Path(test_dir)
+
+    out_csv = cfg.get("infer", {}).get("submission_csv", "submission_v7.csv")
+    out_csv = project_root / out_csv if not os.path.isabs(out_csv) else Path(out_csv)
     out_csv.parent.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() and cfg.get("device", {}).get("cuda", True) else "cpu")
-    assert ckpt_path.exists(), f"找不到權重檔：{ckpt_path}"
-    assert test_dir.exists(), "找不到測試影像資料夾"
 
-    # 模型（與訓練同 cfg；自動依 YAML 選 detector）
-    det_name = str(cfg.get("model", {}).get("detector", "fasterrcnn_r101_fpn_v7"))
-    fg_label = _detector_fg_label(det_name)
-    model = build_detector_from_cfg(cfg).to(device)
-    try:
-        state = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
-    except TypeError:
-        state = torch.load(str(ckpt_path), map_location="cpu")
-    model.load_state_dict(_state_to_fp32(state), strict=True)
-    model.eval()
+    # 檢查
+    assert ckpt_path.exists(), f"[Err] 找不到權重檔：{ckpt_path}"
+    assert test_dir.exists(), f"[Err] 找不到測試影像資料夾：{test_dir}"
 
-    # 推論設定
-    max_side  = int(cfg["augment"]["max_side"])
+    # 建模 + 載入權重
+    model = build_detector_from_cfg(cfg).to(device).eval()
+    state = _safe_load_state(ckpt_path)
+    model.load_state_dict(state, strict=False)
+
+    # 後處理參數
+    score_thr = float(cfg.get("infer", {}).get("score_thr", 0.25))
+    nms_iou   = float(cfg.get("infer", {}).get("nms_iou", 0.50))
     max_det   = int(cfg.get("infer", {}).get("postproc", {}).get("topk_per_image",
-                      int(cfg.get("eval", {}).get("max_det", 100))))
-    tcfg = cfg.get("infer", {}).get("tiling", {})
-    use_tiling = bool(tcfg.get("enabled", False))
+                   int(cfg.get("eval", {}).get("max_det", 100))))
+    max_det   = max(1, min(300, max_det))  # 安全邊界
 
-    imgs = list_images_sorted(str(test_dir))
-    assert len(imgs) > 0, "測試資料夾沒有影像"
+    # 影像清單
+    img_files = _list_images_sorted(str(test_dir))
+    assert len(img_files) > 0, f"[Err] 測試資料夾無影像：{test_dir}"
 
-    print(f"[Infer] detector={det_name} fg_label={fg_label} images={len(imgs)} tiling={use_tiling} max_side={max_side} max_det={max_det}")
+    print(f"[Infer] imgs={len(img_files)} | score_thr={score_thr} nms_iou={nms_iou} topK={max_det}")
     print(f"[CKPT ] {ckpt_path}")
     print(f"[OUT  ] {out_csv}")
 
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["Image_ID", "PredictionString"])
+        writer = csv.writer(f)
+        writer.writerow(["Image_ID", "PredictionString"])
 
-        for img_id, fp in tqdm(list(enumerate(imgs, start=1)), ncols=100, desc="Infer"):
-            pil = Image.open(fp).convert("RGB")
-            if use_tiling:
-                boxes, scores = infer_single_image_tiling(model, pil, device, cfg, fg_label)
-            else:
-                boxes, scores = infer_single_image_no_tiling(model, pil, device, cfg, fg_label)
+        for rank_idx, fp in enumerate(tqdm(img_files, ncols=100, desc="Infer"), start=1):
+            # Image_ID：優先用檔名數字（容忍前導零），無數字回退檔名
+            image_id = _numeric_id_from_path(str(fp), fp.stem if fp.stem else rank_idx)
 
-            # 轉 xywh、組 PredictionString（一定輸出 6*n 欄；class 固定 0）
+            im = Image.open(fp).convert("RGB")
+            W, H = im.size
+            img_tensor = TF.to_tensor(im).to(device)
+
+            out = model([img_tensor])[0]
+            boxes: torch.Tensor = out.get("boxes", torch.empty((0,4), device=device))
+            scores: torch.Tensor = out.get("scores", torch.empty((0,), device=device))
+            # 如需多類別，可讀 out["labels"] 用於 class_id；此作業預設單類別固定 0
+
+            # Score 門檻
+            if boxes.numel() > 0:
+                keep = scores >= score_thr
+                boxes, scores = boxes[keep], scores[keep]
+
+            # NMS
+            if boxes.numel() > 0:
+                keep_idx = nms(boxes, scores, nms_iou)
+                boxes, scores = boxes[keep_idx], scores[keep_idx]
+
+            # Top-K 控制體積
+            if boxes.shape[0] > max_det:
+                topk = scores.topk(max_det).indices
+                boxes, scores = boxes[topk], scores[topk]
+
+            # 裁邊 + 去除非法框
             parts: List[str] = []
             if boxes.numel() > 0:
-                boxes = xyxy_to_xywh(boxes)
-                # 剔除非正寬高（再保險一次）
-                keep = (boxes[:, 2] > 0) & (boxes[:, 3] > 0)
-                boxes = boxes[keep]
-                scores = scores[keep]
+                b = boxes
+                x1 = b[:, 0].clamp_(0, W); y1 = b[:, 1].clamp_(0, H)
+                x2 = b[:, 2].clamp_(0, W); y2 = b[:, 3].clamp_(0, H)
+                boxes = torch.stack([x1, y1, x2, y2], dim=1)
 
-                boxes_np = boxes.cpu().numpy()
-                scores_np = scores.cpu().numpy()
-                for (x, y, w_, h_), conf in zip(boxes_np, scores_np):
-                    parts += [f"{conf:.4f}", f"{int(round(x))}", f"{int(round(y))}",
-                              f"{int(round(w_))}", f"{int(round(h_))}", "0"]  # class 固定 0
+                # 去除 w/h <= 0、NaN
+                xywh = _xyxy_to_xywh(boxes)
+                wv = xywh[:, 2]; hv = xywh[:, 3]
+                finite_mask = torch.isfinite(wv) & torch.isfinite(hv) & torch.isfinite(scores)
+                pos_mask = (wv > 0) & (hv > 0)
+                keep = finite_mask & pos_mask
+                xywh, scores = xywh[keep], scores[keep]
 
-            predstr = " ".join(parts)  # 無檢出 -> 空字串
-            w.writerow([img_id, predstr])
+                # 轉為 PredictionString：四捨五入壓縮體積
+                if xywh.numel() > 0:
+                    xywh_np = xywh.cpu().numpy()
+                    scores_np = scores.cpu().numpy()
+                    for (x, y, w_, h_), conf in zip(xywh_np, scores_np):
+                        x1c, y1c, x2c, y2c = _clip_xyxy(x, y, x + w_, y + h_, W, H)
+                        w2, h2 = x2c - x1c, y2c - y1c
+                        if w2 <= 0 or h2 <= 0:
+                            continue
+                        conf_s = f"{float(conf):.{ROUND_CONF}f}"
+                        x_s = f"{x1c:.{ROUND_COORD}f}"
+                        y_s = f"{y1c:.{ROUND_COORD}f}"
+                        w_s = f"{w2:.{ROUND_COORD}f}"
+                        h_s = f"{h2:.{ROUND_COORD}f}"
+                        parts.extend([conf_s, x_s, y_s, w_s, h_s, str(FIXED_CLASS_ID)])
+
+            writer.writerow([image_id, " ".join(parts)])  # 若無偵測，留空字串即可
 
     print(f"[Done] CSV saved -> {out_csv}")
-
 
 if __name__ == "__main__":
     main()

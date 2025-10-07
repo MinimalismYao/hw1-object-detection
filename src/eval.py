@@ -28,7 +28,7 @@ from config import load_cfg
 CFG_PATH = "experiments/configs/v7.yaml"
 OVERRIDES = [
     # 範例：
-    # "checkpoint.save_full_path=experiments/logs/fasterrcnn_v7/fasterrcnn_v7_best.pth",
+    "checkpoint.save_full_path=experiments/logs/fasterrcnn_v7/fasterrcnn_v7_best.pth",
     # "project.run_name=fasterrcnn_v7_eval",
 ]
 # =================================================

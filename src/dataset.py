@@ -9,17 +9,24 @@ def _list_image_ids(img_dir):
     paths = []
     for ext in _VALID_EXTS:
         paths.extend(glob.glob(os.path.join(img_dir, f"*{ext}")))
-    # 取不含副檔名的檔名
-    ids = [os.path.splitext(os.path.basename(p))[0] for p in paths]
-    # 依「數字值」排序（容忍前導零）
-    def _to_int_id(s):
-        try:
-            s2 = s.lstrip("0")
-            return int(s2) if s2 != "" else 0
-        except Exception:
-            return 0
-    ids = sorted(set(ids), key=lambda x: _to_int_id(x))
+    # 轉「數字 id」→ 零補 8 碼字串；非數字的檔名略過
+    nums = []
+    for p in paths:
+        stem = os.path.splitext(os.path.basename(p))[0]
+        s2 = stem.lstrip("0")
+        if s2 == "":  # 全是 0
+            n = 0
+        else:
+            try:
+                n = int(s2)
+            except Exception:
+                continue  # 非數字檔名略過，避免後續 int(fid) 失敗
+        nums.append(n)
+    nums = sorted(set(nums))
+    # 統一成 8 碼零補字串，跟 gt 的 key 對齊
+    ids = [f"{n:08d}" for n in nums]
     return ids
+
 
 class PigsDataset(Dataset):
     """
