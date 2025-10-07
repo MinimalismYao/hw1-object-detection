@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-src/infer_to_csv_v7.py  ·  Kaggle 提交（RetinaNet/泛用）穩妥版
+src/infer_to_csv_v7.py  ·  Kaggle 提交（FRCNN/RetinaNet/SSDLite 通用）
 - 與訓練同一份 YAML（含 detector/anchors/尺寸/NMS/Tiling）
-- Image_ID: 使用 enumerate 從 1 開始的整數（沿用你 0.17033 那版做法）
-- PredictionString: 一律輸出 6 欄位倍數 => "conf x y w h class"（class 固定 0）
+- Image_ID: 使用 enumerate 從 1 開始的整數
+- PredictionString: 固定 "conf x y w h class"（class 永遠 0）
 """
 
 from pathlib import Path
@@ -19,13 +19,13 @@ from PIL import Image
 from tqdm import tqdm
 
 from config import load_cfg
-from modelv7 import build_detector_from_cfg  # ← v7：可切換架構的工廠
+from modelv7 import build_detector_from_cfg  # v7：可切換架構的工廠
 
 # ========= 覆寫設定（可留空） =========
 CFG_PATH = "experiments/configs/v7.yaml"
 OVERRIDES = [
-    # 指定要用的 checkpoint；若留空會用 YAML 的 checkpoint 配置
-    # "checkpoint.save_full_path=experiments/logs/retinanet_v7/retinanet_v7_best.pth",
+    # 範例：指定 checkpoint 與輸出 run_name
+    # "checkpoint.save_full_path=experiments/logs/fasterrcnn_v7/fasterrcnn_v7_best.pth",
     # "project.run_name=submit_v7",
 ]
 # ====================================
@@ -66,6 +66,15 @@ def _state_to_fp32(state):
     return state
 
 
+def _detector_fg_label(detector_name: str) -> int:
+    """回傳模型輸出中的前景 label（FRCNN=1；Retina/SSD=0）。"""
+    dn = (detector_name or "").lower()
+    if "retina" in dn or "ssd" in dn:
+        return 0
+    return 1  # Faster R-CNN 系列
+
+
+# ---------------- Soft/Hard NMS 封裝 ----------------
 def soft_nms_gaussian(boxes, scores, iou_thresh, sigma, score_thresh) -> List[int]:
     boxes = boxes.clone().cpu()
     scores = scores.clone().cpu()
@@ -78,7 +87,7 @@ def soft_nms_gaussian(boxes, scores, iou_thresh, sigma, score_thresh) -> List[in
         if not order:
             break
         ious = torchvision.ops.box_iou(boxes[i].unsqueeze(0), boxes[order]).squeeze(0)
-        decay = torch.exp(-(ious ** 2) / sigma)
+        decay = torch.exp(-(ious ** 2) / max(1e-9, sigma))
         keep_scores[order] = keep_scores[order] * decay
         order = [j for j in order if keep_scores[j] >= score_thresh]
         order.sort(key=lambda j: float(keep_scores[j]), reverse=True)
@@ -169,8 +178,8 @@ def area_aware_threshold(boxes: torch.Tensor, scores: torch.Tensor, cfg: dict) -
     return boxes[k], scores[k]
 
 
-def infer_single_image_no_tiling(model, pil: Image.Image, device, cfg: dict) -> Tuple[torch.Tensor, torch.Tensor]:
-    """舊路徑：不切塊，維持原有縮放→NMS→面積門檻流程。"""
+# ---------------- 單張推論（不切塊） ----------------
+def infer_single_image_no_tiling(model, pil: Image.Image, device, cfg: dict, fg_label: int) -> Tuple[torch.Tensor, torch.Tensor]:
     W0, H0 = pil.size
     max_side = int(cfg["augment"]["max_side"])
     resized, scale = resize_keep_max_side(pil, max_side)
@@ -178,18 +187,22 @@ def infer_single_image_no_tiling(model, pil: Image.Image, device, cfg: dict) -> 
 
     out = model([tensor])[0]
     boxes, scores, labels = out["boxes"], out["scores"], out["labels"]
-    keep = (labels == 1)
+    keep = (labels == fg_label)
     boxes, scores = boxes[keep], scores[keep]
 
-    # 還原座標
-    if boxes.numel() > 0 and scale != 1.0:
-        boxes = boxes / float(scale)
+    # 還原座標 & 邊界裁切
     if boxes.numel() > 0:
+        if scale != 1.0:
+            boxes = boxes / float(scale)
         x1 = boxes[:, 0].clamp_(0, W0 - 1)
         y1 = boxes[:, 1].clamp_(0, H0 - 1)
         x2 = boxes[:, 2].clamp_(0, W0 - 1)
         y2 = boxes[:, 3].clamp_(0, H0 - 1)
         boxes = torch.stack([x1, y1, x2, y2], dim=1)
+        # 剔除非正寬高
+        wh = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+        kpos = wh > 0
+        boxes, scores = boxes[kpos], scores[kpos]
 
     # NMS + 面積門檻 + TopK
     boxes, scores = run_nms_like_cfg(boxes, scores, cfg)
@@ -197,6 +210,7 @@ def infer_single_image_no_tiling(model, pil: Image.Image, device, cfg: dict) -> 
     return boxes, scores
 
 
+# ---------------- 切塊推論 ----------------
 def make_grid_tiles(W: int, H: int, tile: int, overlap: float) -> List[Tuple[int, int, int, int]]:
     """回傳一組 tile 區塊 (x0,y0,x1,y1) 覆蓋整張圖。"""
     stride = max(1, int(round(tile * (1.0 - overlap))))
@@ -216,13 +230,12 @@ def make_grid_tiles(W: int, H: int, tile: int, overlap: float) -> List[Tuple[int
     return boxes
 
 
-def infer_single_image_tiling(model, pil: Image.Image, device, cfg: dict) -> Tuple[torch.Tensor, torch.Tensor]:
-    """切塊推論：每塊縮到 max_side，推論後還原到原圖，全域再做 NMS/面積門檻。"""
+def infer_single_image_tiling(model, pil: Image.Image, device, cfg: dict, fg_label: int) -> Tuple[torch.Tensor, torch.Tensor]:
     W0, H0 = pil.size
     tcfg = cfg.get("infer", {}).get("tiling", {})
     tile_size = int(tcfg.get("tile_size", 1024))
     overlap   = float(tcfg.get("overlap", 0.15))
-    max_side  = int(cfg["augment"]["max_side"])  # 每塊推論時也縮到這個，避免 model.transform 再縮放
+    max_side  = int(cfg["augment"]["max_side"])  # 每塊推論時也縮到這個
 
     all_boxes, all_scores = [], []
 
@@ -233,17 +246,25 @@ def infer_single_image_tiling(model, pil: Image.Image, device, cfg: dict) -> Tup
 
         out = model([tensor])[0]
         boxes, scores, labels = out["boxes"], out["scores"], out["labels"]
-        keep = (labels == 1)
+        keep = (labels == fg_label)
         boxes, scores = boxes[keep], scores[keep]
 
-        # 還原到「原圖」座標
         if boxes.numel() > 0:
             if scale != 1.0:
                 boxes = boxes / float(scale)
             boxes[:, [0, 2]] += float(x0)
             boxes[:, [1, 3]] += float(y0)
-            all_boxes.append(boxes)
-            all_scores.append(scores)
+            # 邊界裁切與正面積檢查
+            x1c = boxes[:, 0].clamp_(0, W0 - 1)
+            y1c = boxes[:, 1].clamp_(0, H0 - 1)
+            x2c = boxes[:, 2].clamp_(0, W0 - 1)
+            y2c = boxes[:, 3].clamp_(0, H0 - 1)
+            boxes = torch.stack([x1c, y1c, x2c, y2c], dim=1)
+            wh = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+            kpos = wh > 0
+            if kpos.any():
+                all_boxes.append(boxes[kpos])
+                all_scores.append(scores[kpos])
 
     if len(all_boxes) == 0:
         return torch.zeros((0, 4), dtype=torch.float32), torch.zeros((0,), dtype=torch.float32)
@@ -257,6 +278,7 @@ def infer_single_image_tiling(model, pil: Image.Image, device, cfg: dict) -> Tup
     return boxes, scores
 
 
+# ---------------- 主流程 ----------------
 @torch.inference_mode()
 def main():
     project_root = Path(__file__).resolve().parents[1]
@@ -268,11 +290,13 @@ def main():
     out_csv = Path(cfg["infer"]["submission_csv"])
     out_csv.parent.mkdir(parents=True, exist_ok=True)
 
-    device = torch.device("cuda" if torch.cuda.is_available() and cfg["device"]["cuda"] else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() and cfg.get("device", {}).get("cuda", True) else "cpu")
     assert ckpt_path.exists(), f"找不到權重檔：{ckpt_path}"
     assert test_dir.exists(), "找不到測試影像資料夾"
 
-    # ---- 模型（與訓練同 cfg；自動依 YAML 選 detector）----
+    # 模型（與訓練同 cfg；自動依 YAML 選 detector）
+    det_name = str(cfg.get("model", {}).get("detector", "fasterrcnn_r101_fpn_v7"))
+    fg_label = _detector_fg_label(det_name)
     model = build_detector_from_cfg(cfg).to(device)
     try:
         state = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
@@ -281,7 +305,7 @@ def main():
     model.load_state_dict(_state_to_fp32(state), strict=True)
     model.eval()
 
-    # ---- 推論設定 ----
+    # 推論設定
     max_side  = int(cfg["augment"]["max_side"])
     max_det   = int(cfg.get("infer", {}).get("postproc", {}).get("topk_per_image",
                       int(cfg.get("eval", {}).get("max_det", 100))))
@@ -291,7 +315,7 @@ def main():
     imgs = list_images_sorted(str(test_dir))
     assert len(imgs) > 0, "測試資料夾沒有影像"
 
-    print(f"[Infer] images={len(imgs)} tiling={use_tiling} max_side={max_side} max_det={max_det}")
+    print(f"[Infer] detector={det_name} fg_label={fg_label} images={len(imgs)} tiling={use_tiling} max_side={max_side} max_det={max_det}")
     print(f"[CKPT ] {ckpt_path}")
     print(f"[OUT  ] {out_csv}")
 
@@ -301,21 +325,23 @@ def main():
 
         for img_id, fp in tqdm(list(enumerate(imgs, start=1)), ncols=100, desc="Infer"):
             pil = Image.open(fp).convert("RGB")
-
             if use_tiling:
-                boxes, scores = infer_single_image_tiling(model, pil, device, cfg)
+                boxes, scores = infer_single_image_tiling(model, pil, device, cfg, fg_label)
             else:
-                boxes, scores = infer_single_image_no_tiling(model, pil, device, cfg)
+                boxes, scores = infer_single_image_no_tiling(model, pil, device, cfg, fg_label)
 
             # 轉 xywh、組 PredictionString（一定輸出 6*n 欄；class 固定 0）
             parts: List[str] = []
             if boxes.numel() > 0:
                 boxes = xyxy_to_xywh(boxes)
+                # 剔除非正寬高（再保險一次）
+                keep = (boxes[:, 2] > 0) & (boxes[:, 3] > 0)
+                boxes = boxes[keep]
+                scores = scores[keep]
+
                 boxes_np = boxes.cpu().numpy()
                 scores_np = scores.cpu().numpy()
                 for (x, y, w_, h_), conf in zip(boxes_np, scores_np):
-                    if w_ <= 0 or h_ <= 0:
-                        continue
                     parts += [f"{conf:.4f}", f"{int(round(x))}", f"{int(round(y))}",
                               f"{int(round(w_))}", f"{int(round(h_))}", "0"]  # class 固定 0
 
