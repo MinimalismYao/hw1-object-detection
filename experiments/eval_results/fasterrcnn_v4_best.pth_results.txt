@@ -1,0 +1,21 @@
+===== COCO Evaluation Summary =====
+
+AP @[ IoU=0.50:0.95 | area=all | maxDets=100 ]                         = 0.672336
+AP @[ IoU=0.50      | area=all | maxDets=100 ]                         = 0.959924
+AP @[ IoU=0.75      | area=all | maxDets=100 ]                         = 0.740258
+AP @[ IoU=0.50:0.95 | area=small | maxDets=100 ]                       = 0.025580
+AP @[ IoU=0.50:0.95 | area=medium | maxDets=100 ]                      = 0.545066
+AP @[ IoU=0.50:0.95 | area=large | maxDets=100 ]                       = 0.191466
+AR @[ IoU=0.50:0.95 | area=all | maxDets=1 ]                           = 0.031136
+AR @[ IoU=0.50:0.95 | area=all | maxDets=10 ]                          = 0.285123
+AR @[ IoU=0.50:0.95 | area=all | maxDets=100 ]                         = 0.714739
+AR @[ IoU=0.50:0.95 | area=small | maxDets=100 ]                       = 0.523819
+AR @[ IoU=0.50:0.95 | area=medium | maxDets=100 ]                      = 0.721187
+AR @[ IoU=0.50:0.95 | area=large | maxDets=100 ]                       = 0.803591
+
+
+[說明]
+- AP: 平均精度；AR: 平均召回；主指標為 AP@[0.50:0.95]（COCO 標準）。
+- precision 的維度為 [IoU x recall x category x area x maxDets]。
+- recall    的維度為 [IoU x category x area x maxDets]（每個 IoU 的最大可達召回）。
+- 詳細陣列請見 eval_details.json（可用來畫曲線）。

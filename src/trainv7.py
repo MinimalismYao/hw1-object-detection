@@ -386,24 +386,44 @@ def main():
         else:
             print("[Backbone][WARN] 未找到可凍結之 backbone 參數（名稱不符？）")
 
-    # Optimizer（只挑 requires_grad=True 的參數）
-    params = [p for p in model.parameters() if p.requires_grad]
+    # === optimizer: param groups (backbone vs heads) ===
+    def build_param_groups(model, base_lr, wd, head_lr_mult=1.0, backbone_lr_mult=0.33):
+        bb, head = [], []
+        for n, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if n.startswith("backbone"):    # FPN + ResNet backbone
+                bb.append(p)
+            else:                           # RPN/ROI heads
+                head.append(p)
+        return [
+            {"params": bb,   "lr": base_lr * backbone_lr_mult, "weight_decay": wd},
+            {"params": head, "lr": base_lr * head_lr_mult,     "weight_decay": wd},
+        ]
+
+    # 建立 optimizer
     O = cfg.get("optimizer", {}) or {}
-    opt_name = str(O.get("name", O.get("type", "sgd"))).lower()
+    opt_name = str(O.get("name", O.get("type", "adamw"))).lower()
+    base_lr = float(O.get("lr", 8e-5))
+    wd      = float(O.get("weight_decay", 2.5e-3))
+
+    param_groups = build_param_groups(model, base_lr, wd, head_lr_mult=1.0, backbone_lr_mult=0.33)
+
     if opt_name == "adamw":
         optimizer = torch.optim.AdamW(
-            params,
-            lr=float(O.get("lr", 0.0005)),
-            weight_decay=float(O.get("weight_decay", 0.0005)),
-            betas=tuple(O.get("betas", [0.9, 0.999])),
+            param_groups,
+            lr=base_lr,
+            weight_decay=wd,
+            betas=tuple(O.get("betas", [0.9, 0.999]))
         )
     else:
         optimizer = torch.optim.SGD(
-            params,
-            lr=float(O.get("lr", 0.005)),
+            param_groups,
+            lr=base_lr,
             momentum=float(O.get("momentum", 0.9)),
-            weight_decay=float(O.get("weight_decay", 0.0005)),
+            weight_decay=wd
         )
+
 
     # Scheduler（iteration 級 cosine 或 epoch 級 StepLR）
     S = cfg.get("scheduler", {}) or {}

@@ -1,13 +1,4 @@
-# experiments/configs/v7.yaml
-# =========================
-# hw1_od · fasterrcnn_v7 (R101 + FPN P2~P6 + Big RoI Head)
-# 目標：
-#   - 穩定自然收斂（降低 train/val loss gap）
-#   - 抑制過擬合（正則化 + EMA）
-#   - 提升小物件 AP（錨框與 FPN 層級精準對齊）
-#   - 控制顯存（1024輸入 + 小 batch + accumulate）
-# =========================
-
+# experiments/configs/v7.yaml  (anti-overfit strong)
 seed: 42
 
 project:
@@ -17,9 +8,9 @@ project:
   output_root: experiments/logs
   output_dir: ${project.output_root}/${project.run_name}
 
-# ---------------------------------------------------------
-# Data
-# ---------------------------------------------------------
+# -----------------------------
+# Data (補上必需路徑)
+# -----------------------------
 data:
   root: data
   train_img_dir: data/train/img
@@ -31,150 +22,121 @@ data:
   allow_float_bbox: true
   clip_bbox_to_image: true
   drop_invalid_bbox: true
-  min_box_wh: [1, 1]      # 避免過小框導致 NaN
+  min_box_wh: [1, 1]
 
-# ---------------------------------------------------------
-# Model
-# ---------------------------------------------------------
 model:
-  detector: fasterrcnn_r101_fpn_v7   # 名稱保留，工廠會組裝 R50-FPN（無預訓練）
+  detector: fasterrcnn_r101_fpn_v7
   num_classes: 2
 
-  # Normalization：FrozenBN（小 batch 穩）
   norm: "frozenbn"
-
-  # 輸入尺度（固定 1024）
   min_size: 1024
   max_size: 1024
-
   image_mean: [0.485, 0.456, 0.406]
   image_std:  [0.229, 0.224, 0.225]
 
-  # FPN：P2~P6
   fpn_out_channels: 256
   use_p6: true
 
-  # Anchors：逐層主尺度（P2..P6），請勿再用平鋪 rpn_anchor_sizes 覆蓋
-  rpn_anchor_sizes_per_level: [[16],[32],[64],[96],[128]]
+  # Anchors：維持小物件友好
+  # rpn_anchor_sizes_per_level: [[8],[16],[32],[64],[96]] #(kaggle 0.13)
+  rpn_anchor_sizes_per_level: [[8],[16],[28],[48],[80]] 
   rpn_anchor_ratios: [0.5, 1.0, 2.0]
 
-  # RPN：起跑更寬鬆，讓正樣本先進來
+  # RPN：略放寬正樣 (先 recall 再收斂)，但控制 proposals
   rpn:
-    fg_iou_thresh: 0.5
-    bg_iou_thresh: 0.0
+    fg_iou_thresh: 0.6
+    bg_iou_thresh: 0.1
     batch_size_per_image: 256
-    positive_fraction: 0.5
-    pre_nms_top_n_train: 2000
-    post_nms_top_n_train: 1000
-    pre_nms_top_n_test:  1000
-    post_nms_top_n_test: 1000
+    positive_fraction: 0.25
+    pre_nms_top_n_train: 1200
+    post_nms_top_n_train: 600
+    pre_nms_top_n_test:  800
+    post_nms_top_n_test: 500
     nms_thresh: 0.7
 
-  # RoI Head：保守取樣 + 權重為 1（避免回歸爆）
+  # RoI Head：更保守取樣 + 更小 batch，並開 Dropout（modelv7.py 已支援）
   roi:
-    fg_iou_thresh: 0.5
-    bg_iou_thresh: 0.5
-    box_batch_size_per_image: 512
-    box_positive_fraction: 0.25
+    roi_pool_size: 7
+    box_batch_size_per_image: 192
+    box_positive_fraction: 0.20
     bbox_reg_weights: [1.0, 1.0, 1.0, 1.0]
+    detections_per_img: 100
+    score_thresh: 0.0
+    nms_thresh: 0.5
+    dropout_p: 0.40
 
-# ---------------------------------------------------------
-# Augmentation（保守增強，避免 val 分佈偏移）
-# ---------------------------------------------------------
 augment:
-  resize: [896, 1024]
+  resize: [768, 1152]
   max_side: 1024
   flip_p: 0.5
-  color_jitter_prob: 0.6
-  color_jitter: [0.2, 0.1, 0.1, 0.05]
-  hsv: [0.02, 0.5, 0.3]
+  color_jitter_prob: 0.8
+  color_jitter: [0.25, 0.12, 0.12, 0.05]
+  hsv: [0.03, 0.5, 0.3]
   mosaic: false
 
-# ---------------------------------------------------------
-# Train
-# ---------------------------------------------------------
 train:
-  epochs: 54
+  epochs: 72
   batch_size: 2
   accumulate: 4
-  amp: false                # 顯存許可可改 true 加速
+  amp: false
   cudnn_benchmark: true
   grad_clip: 1.0
 
-  # 凍結：前 5 個 epoch 凍結 backbone，之後自動解凍（若收斂慢可改 0）
-  freeze_backbone_epochs: 5
+  # 凍結 backbone 更久；先把頭訓練好，再解凍微調
+  freeze_backbone_epochs: 12
 
-  # EMA：平滑權重（過擬合時更穩）
+  # EMA：略降平滑力度
   model_ema:
     enabled: true
-    decay: 0.9998
+    decay: 0.9990
 
-  # Early Stop
+  # Early Stop：更積極
   early_stop:
     enabled: true
     monitor: val_loss
     mode: min
     patience: 6
     save_best: true
-    best_name: ${project.run_name}_best.pth   # ← 修掉多餘的 "}"
+    best_name: ${project.run_name}_best.pth
 
-# ---------------------------------------------------------
-# Optimizer（小步長，穩定泛化）
-# ---------------------------------------------------------
 optimizer:
   type: adamw
-  lr: 0.0001
-  weight_decay: 0.0015
-  betas: [0.9, 0.999]
+  lr: 0.00008
+  weight_decay: 0.0020
+  head_lr_mult: 1.0
+  backbone_lr_mult: 0.33
 
-# ---------------------------------------------------------
-# Scheduler（Cosine + Warmup）
-# ---------------------------------------------------------
+# 讓 cosine 收尾更低，盡量別抬起尾巴繼續擬合
 scheduler:
   name: cosine
   warmup:
     type: linear
-    steps: 800
+    steps: 1000
     start_factor: 0.1
-  min_lr_ratio: 0.05
+  min_lr_ratio: 0.15
 
-# ---------------------------------------------------------
-# Dataloader
-# ---------------------------------------------------------
 dataloader:
   pin_memory: true
   persistent_workers: true
   prefetch_factor: 2
   shuffle: true
 
-# ---------------------------------------------------------
-# Sanity Check（與訓練同尺度，避免初始化誤判）
-# ---------------------------------------------------------
 sanity_check:
   enabled: true
   batch_size: 1
   max_side: 1024
 
-# ---------------------------------------------------------
-# Checkpoint
-# ---------------------------------------------------------
 checkpoint:
   dir: ${project.output_dir}
   name: ${project.run_name}.pth
   save_last_only: false
   save_full_path: ${checkpoint.dir}/${checkpoint.name}
 
-# ---------------------------------------------------------
-# Logging
-# ---------------------------------------------------------
 logging:
   csv_name: train_log.csv
   csv_path: ${project.output_dir}/${logging.csv_name}
   print_interval: 10
 
-# ---------------------------------------------------------
-# Evaluation
-# ---------------------------------------------------------
 eval:
   run_after_train: true
   iou_thresholds: [0.50,0.55,0.60,0.65,0.70,0.75,0.80,0.85,0.90,0.95]
@@ -188,16 +150,10 @@ eval:
     medium: [1024, 9216]
     large:  [9216, 1e10]
 
-# ---------------------------------------------------------
-# Inference
-# ---------------------------------------------------------
 infer:
-  score_thr: 0.25
+  score_thr: 0.40
   nms_iou: 0.5
   submission_csv: submissions/${project.run_name}_submission.csv
 
-# ---------------------------------------------------------
-# Device
-# ---------------------------------------------------------
 device:
   cuda: true
