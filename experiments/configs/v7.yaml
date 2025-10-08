@@ -28,9 +28,12 @@ model:
   detector: fasterrcnn_r101_fpn_v7
   num_classes: 2
 
-  norm: "frozenbn"
-  min_size: 1024
-  max_size: 1024
+  #norm: "frozenbn"
+  norm: "bn"
+  # min_size: 1024
+  # max_size: 1024
+  min_size: 1280
+  max_size: 1280
   image_mean: [0.485, 0.456, 0.406]
   image_std:  [0.229, 0.224, 0.225]
 
@@ -48,10 +51,14 @@ model:
     bg_iou_thresh: 0.1
     batch_size_per_image: 256
     positive_fraction: 0.25
-    pre_nms_top_n_train: 1200
-    post_nms_top_n_train: 600
-    pre_nms_top_n_test:  800
-    post_nms_top_n_test: 500
+    # pre_nms_top_n_train: 1200
+    pre_nms_top_n_train: 4000
+    # post_nms_top_n_train: 600
+    post_nms_top_n_train: 2000
+    # pre_nms_top_n_test:  800
+    pre_nms_top_n_test:  2000
+    # post_nms_top_n_test: 500
+    post_nms_top_n_test: 1000
     nms_thresh: 0.7
 
   # RoI Head：更保守取樣 + 更小 batch，並開 Dropout（modelv7.py 已支援）
@@ -63,10 +70,12 @@ model:
     detections_per_img: 100
     score_thresh: 0.0
     nms_thresh: 0.5
-    dropout_p: 0.40
+    # dropout_p: 0.40
+    dropout_p: 0.20
 
 augment:
-  resize: [768, 1152]
+  # resize: [768, 1152]
+  resize: [1024, 1280]
   max_side: 1024
   flip_p: 0.5
   color_jitter_prob: 0.8
@@ -75,12 +84,15 @@ augment:
   mosaic: false
 
 train:
-  epochs: 72
+  # epochs: 72
+  epochs: 100
   batch_size: 2
   accumulate: 4
-  amp: false
+  # amp: false
+  amp: true
   cudnn_benchmark: true
-  grad_clip: 1.0
+  # grad_clip: 1.0
+  grad_clip: 10
 
   # 凍結 backbone 更久；先把頭訓練好，再解凍微調
   freeze_backbone_epochs: 12
@@ -95,13 +107,15 @@ train:
     enabled: true
     monitor: val_loss
     mode: min
-    patience: 6
+    patience: 8
     save_best: true
     best_name: ${project.run_name}_best.pth
 
 optimizer:
-  type: adamw
-  lr: 0.00008
+  # type: adamw
+  type: sgd
+  # lr: 0.00008
+  lr: 0.0035
   weight_decay: 0.0020
   head_lr_mult: 1.0
   backbone_lr_mult: 0.33
