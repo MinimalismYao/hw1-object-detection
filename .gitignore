@@ -30,6 +30,7 @@ runs/
 checkpoints/
 vis_gt/
 vis_pred/
+vis_pred_v7/
 
 # ---- 系統相關檔案 (避免 Mac / Windows 雜檔被推上去) ----
 .DS_Store

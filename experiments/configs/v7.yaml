@@ -1,4 +1,5 @@
 # experiments/configs/v7.yaml  (anti-overfit strong)
+# Model v7: Faster R-CNN R101 FPN + 強化版 Aug + Dropout + 調整超參數（舊參數已註解）
 seed: 42
 
 project:
@@ -27,13 +28,12 @@ data:
 model:
   detector: fasterrcnn_r101_fpn_v7
   num_classes: 2
-
   #norm: "frozenbn"
   norm: "bn"
   # min_size: 1024
   # max_size: 1024
-  min_size: 1280
-  max_size: 1280
+  min_size: 1536
+  max_size: 1536
   image_mean: [0.485, 0.456, 0.406]
   image_std:  [0.229, 0.224, 0.225]
 
@@ -42,45 +42,45 @@ model:
 
   # Anchors：維持小物件友好
   # rpn_anchor_sizes_per_level: [[8],[16],[32],[64],[96]] #(kaggle 0.13)
-  rpn_anchor_sizes_per_level: [[8],[16],[28],[48],[80]] 
-  rpn_anchor_ratios: [0.5, 1.0, 2.0]
+  rpn_anchor_sizes_per_level: [[8],[16],[32],[64],[128],[256]] 
+  rpn_anchor_ratios: [0.5, 1.0, 1.5]
 
   # RPN：略放寬正樣 (先 recall 再收斂)，但控制 proposals
   rpn:
-    fg_iou_thresh: 0.6
+    fg_iou_thresh: 0.5
     bg_iou_thresh: 0.1
-    batch_size_per_image: 256
-    positive_fraction: 0.25
+    batch_size_per_image: 512
+    positive_fraction: 0.5
     # pre_nms_top_n_train: 1200
-    pre_nms_top_n_train: 4000
+    pre_nms_top_n_train: 6000
     # post_nms_top_n_train: 600
-    post_nms_top_n_train: 2000
+    post_nms_top_n_train: 6000
     # pre_nms_top_n_test:  800
-    pre_nms_top_n_test:  2000
+    pre_nms_top_n_test:  4000
     # post_nms_top_n_test: 500
-    post_nms_top_n_test: 1000
+    post_nms_top_n_test: 1500
     nms_thresh: 0.7
 
   # RoI Head：更保守取樣 + 更小 batch，並開 Dropout（modelv7.py 已支援）
   roi:
     roi_pool_size: 7
-    box_batch_size_per_image: 192
-    box_positive_fraction: 0.20
+    box_batch_size_per_image: 512
+    box_positive_fraction: 0.25
     bbox_reg_weights: [1.0, 1.0, 1.0, 1.0]
     detections_per_img: 100
     score_thresh: 0.0
     nms_thresh: 0.5
     # dropout_p: 0.40
-    dropout_p: 0.20
+    dropout_p: 0.15
 
 augment:
   # resize: [768, 1152]
-  resize: [1024, 1280]
-  max_side: 1024
+  resize: null
+  #max_side: 1024
   flip_p: 0.5
-  color_jitter_prob: 0.8
+  color_jitter_prob: 0.2
   color_jitter: [0.25, 0.12, 0.12, 0.05]
-  hsv: [0.03, 0.5, 0.3]
+  hsv: [0.02, 0.3, 0.2]
   mosaic: false
 
 train:
@@ -111,14 +111,14 @@ train:
     save_best: true
     best_name: ${project.run_name}_best.pth
 
-optimizer:
-  # type: adamw
-  type: sgd
-  # lr: 0.00008
-  lr: 0.0035
-  weight_decay: 0.0020
-  head_lr_mult: 1.0
-  backbone_lr_mult: 0.33
+  optimizer:
+    type: sgd
+    lr: 0.0035            # R101 + BN + 1280輸入，這個量級OK
+    momentum: 0.9         # 重要！沒寫就=0
+    nesterov: false       # 先關，穩定後再考慮開
+    weight_decay: 0.0005
+    head_lr_mult: 1.0
+    backbone_lr_mult: 0.33
 
 # 讓 cosine 收尾更低，盡量別抬起尾巴繼續擬合
 scheduler:
@@ -138,7 +138,7 @@ dataloader:
 sanity_check:
   enabled: true
   batch_size: 1
-  max_side: 1024
+  max_side: 1536
 
 checkpoint:
   dir: ${project.output_dir}

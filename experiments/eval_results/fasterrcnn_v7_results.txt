@@ -1,17 +1,17 @@
 ===== COCO Evaluation Summary =====
 
-AP @[ IoU=0.50:0.95 | area=all | maxDets=300 ]              = 0.743215
-AP @[ IoU=0.50      | area=all | maxDets=300 ]              = 0.973464
-AP @[ IoU=0.75      | area=all | maxDets=300 ]              = 0.836136
-AP @[ IoU=0.50:0.95 | area=small | maxDets=300 ]            = 0.042896
-AP @[ IoU=0.50:0.95 | area=medium | maxDets=300 ]           = 0.582062
-AP @[ IoU=0.50:0.95 | area=large | maxDets=300 ]            = 0.188887
-AR @[ IoU=0.50:0.95 | area=all | maxDets=1 ]                           = 0.030066
-AR @[ IoU=0.50:0.95 | area=all | maxDets=10 ]                          = 0.297860
-AR @[ IoU=0.50:0.95 | area=all | maxDets=100 ]                         = 0.782223
-AR @[ IoU=0.50:0.95 | area=small | maxDets=100 ]                       = 0.646612
-AR @[ IoU=0.50:0.95 | area=medium | maxDets=100 ]                      = 0.781322
-AR @[ IoU=0.50:0.95 | area=large | maxDets=100 ]                       = 0.880525
+AP @[ IoU=0.50:0.95 | area=all | maxDets=300 ]              = 0.777100
+AP @[ IoU=0.50      | area=all | maxDets=300 ]              = 0.975305
+AP @[ IoU=0.75      | area=all | maxDets=300 ]              = 0.874797
+AP @[ IoU=0.50:0.95 | area=small | maxDets=300 ]            = 0.048059
+AP @[ IoU=0.50:0.95 | area=medium | maxDets=300 ]           = 0.622311
+AP @[ IoU=0.50:0.95 | area=large | maxDets=300 ]            = 0.151921
+AR @[ IoU=0.50:0.95 | area=all | maxDets=1 ]                           = 0.031153
+AR @[ IoU=0.50:0.95 | area=all | maxDets=10 ]                          = 0.300777
+AR @[ IoU=0.50:0.95 | area=all | maxDets=100 ]                         = 0.811029
+AR @[ IoU=0.50:0.95 | area=small | maxDets=100 ]                       = 0.660164
+AR @[ IoU=0.50:0.95 | area=medium | maxDets=100 ]                      = 0.814707
+AR @[ IoU=0.50:0.95 | area=large | maxDets=100 ]                       = 0.890331
 
 
 [說明]
