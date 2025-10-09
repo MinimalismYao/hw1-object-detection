@@ -1,5 +1,5 @@
-# experiments/configs/v7.yaml  (anti-overfit strong)
-# Model v7: Faster R-CNN R101 FPN + 強化版 Aug + Dropout + 調整超參數（舊參數已註解）
+# experiments/configs/v7.yaml  (anti-overfit strong · final)
+# Model v7: Faster R-CNN R101 FPN + PhotometricAug + 調參
 seed: 42
 
 project:
@@ -10,7 +10,7 @@ project:
   output_dir: ${project.output_root}/${project.run_name}
 
 # -----------------------------
-# Data (補上必需路徑)
+# Data
 # -----------------------------
 data:
   root: data
@@ -25,15 +25,18 @@ data:
   drop_invalid_bbox: true
   min_box_wh: [1, 1]
 
+# -----------------------------
+# Model
+# -----------------------------
 model:
   detector: fasterrcnn_r101_fpn_v7
   num_classes: 2
-  #norm: "frozenbn"
   norm: "bn"
-  # min_size: 1024
-  # max_size: 1024
+
+  # 與外部 transform 尺寸一致（長邊 1536）
   min_size: 1536
   max_size: 1536
+
   image_mean: [0.485, 0.456, 0.406]
   image_std:  [0.229, 0.224, 0.225]
 
@@ -41,27 +44,22 @@ model:
   use_p6: true
 
   # Anchors：維持小物件友好
-  # rpn_anchor_sizes_per_level: [[8],[16],[32],[64],[96]] #(kaggle 0.13)
-  rpn_anchor_sizes_per_level: [[8],[16],[32],[64],[128],[256]] 
+  rpn_anchor_sizes_per_level: [[8],[16],[32],[64],[128],[256]]
   rpn_anchor_ratios: [0.5, 1.0, 1.5]
 
-  # RPN：略放寬正樣 (先 recall 再收斂)，但控制 proposals
+  # RPN
   rpn:
     fg_iou_thresh: 0.5
     bg_iou_thresh: 0.1
     batch_size_per_image: 512
     positive_fraction: 0.5
-    # pre_nms_top_n_train: 1200
     pre_nms_top_n_train: 6000
-    # post_nms_top_n_train: 600
     post_nms_top_n_train: 6000
-    # pre_nms_top_n_test:  800
     pre_nms_top_n_test:  4000
-    # post_nms_top_n_test: 500
     post_nms_top_n_test: 1500
     nms_thresh: 0.7
 
-  # RoI Head：更保守取樣 + 更小 batch，並開 Dropout（modelv7.py 已支援）
+  # RoI Head
   roi:
     roi_pool_size: 7
     box_batch_size_per_image: 512
@@ -70,39 +68,59 @@ model:
     detections_per_img: 100
     score_thresh: 0.0
     nms_thresh: 0.5
-    # dropout_p: 0.40
     dropout_p: 0.15
 
+# -----------------------------
+# Augment / Transforms
+# -----------------------------
 augment:
-  # resize: [768, 1152]
-  resize: null
-  #max_side: 1024
+  # 與 model 同步（TrainTransforms 會將長邊對齊到此值）
+  max_side: 1536
   flip_p: 0.5
   color_jitter_prob: 0.2
   color_jitter: [0.25, 0.12, 0.12, 0.05]
   hsv: [0.02, 0.3, 0.2]
+  resize: null
   mosaic: false
 
+  # 啟用 PhotometricAug（只改像素、不動 bbox）
+  enable_photometric: true
+  photometric_cfg:
+    p_color_jitter: 0.8
+    brightness: 0.25
+    contrast: 0.25
+    saturation: 0.25
+    hue: 0.04
+    p_gray: 0.05
+    p_autocontrast: 0.30
+    p_equalize: 0.20
+    p_gamma: 0.60
+    gamma_range: [0.80, 1.30]
+    p_sharpen: 0.15
+    sharpness: [0.95, 1.15]
+    p_blur: 0.10
+    blur_radius: [0.4, 0.9]
+    p_clahe: 0.60          # 若環境無 cv2，程式會自動關閉
+    clahe_clip: 2.0
+    clahe_grid: [8, 8]
+    p_gray_world_wb: 0.35
+
+# -----------------------------
+# Train
+# -----------------------------
 train:
-  # epochs: 72
   epochs: 100
   batch_size: 2
   accumulate: 4
-  # amp: false
   amp: true
   cudnn_benchmark: true
-  # grad_clip: 1.0
   grad_clip: 10
+  freeze_backbone_epochs: 18
 
-  # 凍結 backbone 更久；先把頭訓練好，再解凍微調
-  freeze_backbone_epochs: 12
-
-  # EMA：略降平滑力度
   model_ema:
     enabled: true
     decay: 0.9990
 
-  # Early Stop：更積極
   early_stop:
     enabled: true
     monitor: val_loss
@@ -113,14 +131,16 @@ train:
 
   optimizer:
     type: sgd
-    lr: 0.0035            # R101 + BN + 1280輸入，這個量級OK
-    momentum: 0.9         # 重要！沒寫就=0
-    nesterov: false       # 先關，穩定後再考慮開
+    lr: 0.0035
+    momentum: 0.9
+    nesterov: false
     weight_decay: 0.0005
     head_lr_mult: 1.0
     backbone_lr_mult: 0.33
 
-# 讓 cosine 收尾更低，盡量別抬起尾巴繼續擬合
+# -----------------------------
+# Scheduler
+# -----------------------------
 scheduler:
   name: cosine
   warmup:
@@ -129,17 +149,26 @@ scheduler:
     start_factor: 0.1
   min_lr_ratio: 0.15
 
+# -----------------------------
+# Dataloader
+# -----------------------------
 dataloader:
   pin_memory: true
   persistent_workers: true
   prefetch_factor: 2
   shuffle: true
 
+# -----------------------------
+# Sanity Check
+# -----------------------------
 sanity_check:
   enabled: true
   batch_size: 1
   max_side: 1536
 
+# -----------------------------
+# Checkpoint & Logging
+# -----------------------------
 checkpoint:
   dir: ${project.output_dir}
   name: ${project.run_name}.pth
@@ -151,6 +180,9 @@ logging:
   csv_path: ${project.output_dir}/${logging.csv_name}
   print_interval: 10
 
+# -----------------------------
+# Eval
+# -----------------------------
 eval:
   run_after_train: true
   iou_thresholds: [0.50,0.55,0.60,0.65,0.70,0.75,0.80,0.85,0.90,0.95]
@@ -164,6 +196,9 @@ eval:
     medium: [1024, 9216]
     large:  [9216, 1e10]
 
+# -----------------------------
+# Infer (保持與訓練一致的後處理)
+# -----------------------------
 infer:
   score_thr: 0.40
   nms_iou: 0.5

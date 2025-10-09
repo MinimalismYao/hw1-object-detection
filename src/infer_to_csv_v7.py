@@ -30,9 +30,9 @@ IMG_DIR = "data/test/img"
 OUT_CSV = "submissions/fasterrcnn_v7_submission.csv"
 
 # 推論超參（外部控制，不依賴模型內門檻）
-SCORE_THRESH = 0.25          # 全域最低分數門檻（中/大框）
-NMS_THRESH   = 0.55          # Hard-NMS IoU（僅當 USE_SOFT_NMS=False）
-MAX_DETS_PER_IMG = 80        # 每張圖最多保留
+SCORE_THRESH = 0.01          # 全域最低分數門檻（中/大框）
+NMS_THRESH   = 0.50          # Hard-NMS IoU（僅當 USE_SOFT_NMS=False）
+MAX_DETS_PER_IMG = 150        # 每張圖最多保留
 CLIP_TO_IMAGE = True
 ROUND_DECIMALS = 2           # bbox 輸出小數位
 CLASS_ID = 0                 # 單類別 pig

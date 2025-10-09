@@ -146,7 +146,12 @@ def build_iter_scheduler(optimizer, scfg: Dict[str, Any], total_iters: int):
 # ---------------- Quick Sanity Check ----------------
 @torch.no_grad()
 def quick_sanity_check(model, device, cfg: Dict[str, Any], detector_name: str):
-    tfm = get_transforms(train=True, max_side=int(cfg.get("sanity_check", {}).get("max_side", 640)))
+    tfm = get_transforms(
+        train=True,
+        max_side=int(cfg.get("sanity_check", {}).get("max_side", 640)),
+        enable_photometric=bool(cfg.get("augment", {}).get("enable_photometric", True)),
+        photometric_cfg=cfg.get("augment", {}).get("photometric_cfg", {}) or {},
+    )
     ds = PigsDataset(cfg["data"]["train_img_dir"], cfg["data"]["train_gt"], transforms=tfm)
     loader = DataLoader(ds, batch_size=int(cfg.get("sanity_check", {}).get("batch_size", 2)),
                         shuffle=True, num_workers=0, collate_fn=collate_fn)
@@ -333,16 +338,18 @@ def main():
         max_side=max_side,
         flip_p=float(A.get("flip_p", 0.5)),
         hsv=A.get("hsv", [0.015, 0.70, 0.40]),
-        resize=A.get("resize", [896, 1024]),
+        resize=A.get("resize", None),
         mosaic=bool(A.get("mosaic", False)),
-        min_box_size=float(cfg.get("data", {}).get("min_box_wh", [1, 1])[0]),
+        min_box_size=float((cfg.get("data", {}).get("min_box_wh", [1, 1]) or [1])[0]),
         color_jitter_prob=float(A.get("color_jitter_prob", 0.0)),
         color_jitter=A.get("color_jitter", [0.0, 0.0, 0.0, 0.0]),
+        enable_photometric=bool(A.get("enable_photometric", True)),
+        photometric_cfg=A.get("photometric_cfg", {}) or {},
     )
     val_tfms = get_transforms(
         train=False,
         max_side=max_side,
-        min_box_size=float(cfg.get("data", {}).get("min_box_wh", [1, 1])[0]),
+        min_box_size=float((cfg.get("data", {}).get("min_box_wh", [1, 1]) or [1])[0]),
     )
 
     # Dataset / DataLoader
@@ -350,15 +357,15 @@ def main():
     ds_val   = PigsDataset(cfg["data"]["val_img_dir"],   cfg["data"]["val_gt"],   transforms=val_tfms)
     print(f"[Data] train={len(ds_train)} | val={len(ds_val)}")
 
-    D = cfg.get("dataloader", {}) or {}
+    Dcfg = cfg.get("dataloader", {}) or {}
     loader_train = DataLoader(
         ds_train,
         batch_size=int(cfg.get("train", {}).get("batch_size", 2)),
-        shuffle=bool(D.get("shuffle", True)),
+        shuffle=bool(Dcfg.get("shuffle", True)),
         num_workers=int(cfg.get("data", {}).get("num_workers", 4)),
-        pin_memory=bool(D.get("pin_memory", True)),
-        persistent_workers=bool(D.get("persistent_workers", False)),
-        prefetch_factor=int(D.get("prefetch_factor", 2)),
+        pin_memory=bool(Dcfg.get("pin_memory", True)),
+        persistent_workers=bool(Dcfg.get("persistent_workers", False)),
+        prefetch_factor=int(Dcfg.get("prefetch_factor", 2)),
         collate_fn=collate_fn,
     )
 
@@ -371,15 +378,15 @@ def main():
         batch_size=max(1, int(cfg.get("sanity_check", {}).get("batch_size", 2))),
         shuffle=False,
         num_workers=int(cfg.get("data", {}).get("num_workers", 4)),
-        pin_memory=bool(D.get("pin_memory", True)),
-        persistent_workers=bool(D.get("persistent_workers", False)),
-        prefetch_factor=int(D.get("prefetch_factor", 2)),
+        pin_memory=bool(Dcfg.get("pin_memory", True)),
+        persistent_workers=bool(Dcfg.get("persistent_workers", False)),
+        prefetch_factor=int(Dcfg.get("prefetch_factor", 2)),
         collate_fn=collate_fn,
     )
 
     # === 先凍結再建 Optimizer（關鍵順序） ===
-    T = cfg.get("train", {}) or {}
-    freeze_epochs = int(T.get("freeze_backbone_epochs", 0))
+    tcfg = cfg.get("train", {}) or {}
+    freeze_epochs = int(tcfg.get("freeze_backbone_epochs", 0))
     if freeze_epochs > 0:
         if _set_backbone_requires_grad(model, False):
             print(f"[Backbone] frozen for first {freeze_epochs} epochs.")
@@ -407,7 +414,13 @@ def main():
     base_lr = float(O.get("lr", 8e-5))
     wd      = float(O.get("weight_decay", 2.5e-3))
 
-    param_groups = build_param_groups(model, base_lr, wd, head_lr_mult=1.0, backbone_lr_mult=0.33)
+    param_groups = build_param_groups(
+        model,
+        base_lr,
+        wd,
+        head_lr_mult=float(O.get("head_lr_mult", 1.0)),
+        backbone_lr_mult=float(O.get("backbone_lr_mult", 0.33)),
+    )
 
     if opt_name == "adamw":
         optimizer = torch.optim.AdamW(
@@ -421,36 +434,36 @@ def main():
             param_groups,
             lr=base_lr,
             momentum=float(O.get("momentum", 0.9)),
+            nesterov=bool(O.get("nesterov", False)),
             weight_decay=wd
         )
 
-
     # Scheduler（iteration 級 cosine 或 epoch 級 StepLR）
-    S = cfg.get("scheduler", {}) or {}
-    epochs = int(T.get("epochs", 30))
+    Scfg = cfg.get("scheduler", {}) or {}
+    epochs = int(tcfg.get("epochs", 30))
     total_iters = len(loader_train) * epochs
     scheduler_iter = None
-    sname = str(S.get("name", S.get("type", "cosine"))).lower()
+    sname = str(Scfg.get("name", Scfg.get("type", "cosine"))).lower()
     if sname in ("cosine", "cosineanneal", "cosineannealing", "cosineannealinglr"):
-        scheduler_iter = build_iter_scheduler(optimizer, S, total_iters)
+        scheduler_iter = build_iter_scheduler(optimizer, Scfg, total_iters)
         scheduler_epoch = None
     else:
         scheduler_iter = None
-        scheduler_epoch = StepLR(optimizer, step_size=int(S.get("step_size", 8)), gamma=float(S.get("gamma", 0.1)))
+        scheduler_epoch = StepLR(optimizer, step_size=int(Scfg.get("step_size", 8)), gamma=float(Scfg.get("gamma", 0.1)))
 
     # AMP / Accumulate / EMA / EarlyStop
-    amp_enabled = bool(T.get("amp", True))
+    amp_enabled = bool(tcfg.get("amp", True))
     scaler      = GradScaler(enabled=amp_enabled and device.type == "cuda")
-    accumulate  = int(T.get("accumulate", 1))
-    grad_clip   = float(T.get("grad_clip", T.get("grad_clip_norm", 0.0))) or None
+    accumulate  = int(tcfg.get("accumulate", 1))
+    grad_clip   = float(tcfg.get("grad_clip", tcfg.get("grad_clip_norm", 0.0))) or None
     print_itvl  = int(cfg.get("logging", {}).get("print_interval", 10))
 
-    ema_cfg     = T.get("model_ema", {}) or {}
+    ema_cfg     = tcfg.get("model_ema", {}) or {}
     ema_enabled = bool(ema_cfg.get("enabled", False))
     ema_decay   = float(ema_cfg.get("decay", 0.9995))
     ema         = ModelEMA(model, decay=ema_decay, device=device) if ema_enabled else None
 
-    es_cfg      = T.get("early_stop", {}) or {}
+    es_cfg      = tcfg.get("early_stop", {}) or {}
     es_enabled  = bool(es_cfg.get("enabled", False))
     es_monitor  = str(es_cfg.get("monitor", "val_loss"))
     es_mode     = str(es_cfg.get("mode", "min"))
@@ -468,11 +481,11 @@ def main():
     ckpt_best = ckpt_dir / ckpt_name.replace(".pth", "_best.pth")
 
     # Skip-OOD 門檻（可由 YAML train.skip_ood.* 覆蓋）
-    skip_cfg = (T.get("skip_ood", {}) or {})
+    skip_cfg = (tcfg.get("skip_ood", {}) or {})
 
     # 訓練回圈
     best_val = float("inf") if es_mode == "min" else -float("inf")
-    print(f"[Train] epochs={epochs}, batch={T.get('batch_size', 2)}, amp={amp_enabled}, accumulate={accumulate}")
+    print(f"[Train] epochs={epochs}, batch={tcfg.get('batch_size', 2)}, amp={amp_enabled}, accumulate={accumulate}")
     for epoch in range(epochs):
         # 達到解凍時間點時，解凍 backbone（並把新解凍參數加入 optimizer）
         if freeze_epochs > 0 and epoch == freeze_epochs:
