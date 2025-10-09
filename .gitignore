@@ -8,10 +8,6 @@ __pycache__/
 *.pyo
 *.pyd
 
-# ---- 虛擬環境 (conda/venv)，每個人環境不同，不應上傳 ----
-.venv/
-env/
-venv/
 
 # ---- Dataset (Kaggle 下載)，檔案太大，請助教自行下載即可 ----
 data/train/
@@ -22,19 +18,10 @@ data/val
 
 # ---- 訓練與驗證 log (tensorboard, checkpoint)，檔案通常很大 ----
 experiments/logs/
-submissions/
 *.pth
 *.pt
 *.ckpt
-runs/
-checkpoints/
 vis_gt/
 vis_pred/
 vis_pred_v7/
 
-# ---- 系統相關檔案 (避免 Mac / Windows 雜檔被推上去) ----
-.DS_Store
-Thumbs.db
-
-# ---- Jupyter Notebook 的自動檔案 (如果有使用) ----
-.ipynb_checkpoints/

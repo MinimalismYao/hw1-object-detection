@@ -115,7 +115,7 @@ train:
   amp: true
   cudnn_benchmark: true
   grad_clip: 10
-  freeze_backbone_epochs: 18
+  freeze_backbone_epochs: 12
 
   model_ema:
     enabled: true
