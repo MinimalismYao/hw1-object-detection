@@ -1,5 +1,5 @@
 <!-- cSpell:disable -->
-# README.md (初稿)
+# README.md
 
 > 所有 git 操作皆可在 vscode 原始檔控制功能完成。
 
@@ -109,9 +109,4 @@ python src/infer_to_csv.py --checkpoint experiments/logs/best_model.pth --out su
 
 ---
 
-## 作者
-
-* 學校：`NTUT`
-* 學號：`114408051`
-* 課程：TAICA - CVPDL
 
